@@ -1,0 +1,8 @@
+registers:
+  - endpoint: /webhook/alertmanager
+    method: POST
+    target:
+      url: http://localhost:8080
+      method: POST
+    template: |
+      {"msg": "Hello {{ name }}"}
