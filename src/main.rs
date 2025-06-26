@@ -232,12 +232,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .layer(ServiceBuilder::new().layer(TraceLayer::new_for_http()))
         .with_state(state);
 
-    let ip = "127.0.0.1";
+    let ip = "0.0.0.0";
     let port = "3000";
     let addr = format!("{}:{}", ip, port);
 
     // Start the server
-    println!("Webhook proxy server running on http://127.0.0.1:3000");
+    println!("Webhook proxy server running on http://{}", addr);
     let listener = TcpListener::bind(addr).await.unwrap();
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
