@@ -2,36 +2,27 @@ use axum::{
     extract::{Path, State},
     http::StatusCode,
     response::Json,
-    routing::any,
+    routing::{any, get},
     Router,
 };
+use clap::Parser;
 use handlebars::Handlebars;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 use tokio::net::TcpListener;
 use tower::ServiceBuilder;
 use tower_http::trace::TraceLayer;
+use tracing::{info, error, warn};
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
-#[derive(Debug, Clone, Deserialize)]
-struct Config {
-    registers: Vec<WebhookRegister>,
-}
+pub mod config;
+pub mod health;
+pub mod admin;
 
-#[derive(Debug, Clone, Deserialize)]
-struct WebhookRegister {
-    endpoint: String,
-    method: String,
-    target: Target,
-    template: String,
-}
+use config::{Args, Config, WebhookRegister, Target};
 
-#[derive(Debug, Clone, Deserialize)]
-struct Target {
-    url: String,
-    method: String,
-}
 
 #[derive(Debug, Serialize)]
 struct ErrorResponse {
@@ -43,10 +34,11 @@ struct AppState {
     registers: HashMap<String, WebhookRegister>,
     handlebars: Arc<Handlebars<'static>>,
     http_client: Client,
+    config: Config,
 }
 
 impl AppState {
-    fn new(config: Config) -> Self {
+    fn new(config: Config, args: &Args) -> Self {
         let mut registers = HashMap::new();
         let mut handlebars = Handlebars::new();
 
@@ -62,10 +54,17 @@ impl AppState {
             registers.insert(register.endpoint.clone(), register_with_template);
         }
 
+        // Configure HTTP client with timeout
+        let http_client = Client::builder()
+            .timeout(Duration::from_secs(args.request_timeout))
+            .build()
+            .expect("Failed to create HTTP client");
+
         Self {
             registers,
             handlebars: Arc::new(handlebars),
-            http_client: Client::new(),
+            http_client,
+            config,
         }
     }
 }
@@ -76,9 +75,16 @@ async fn handle_webhook(
     body: String,
 ) -> Result<Json<Value>, (StatusCode, Json<ErrorResponse>)> {
     let endpoint = format!("/{}", path);
+    
+    info!(
+        endpoint = %endpoint,
+        payload_size = body.len(),
+        "Processing webhook request"
+    );
 
     // Find the matching register
     let register = state.registers.get(&endpoint).ok_or_else(|| {
+        warn!(endpoint = %endpoint, "Webhook endpoint not found");
         (
             StatusCode::NOT_FOUND,
             Json(ErrorResponse {
@@ -185,7 +191,7 @@ async fn handle_debug_request(
     ))
 }
 
-fn json_to_template_data(value: &Value) -> Map<String, Value> {
+pub fn json_to_template_data(value: &Value) -> Map<String, Value> {
     match value {
         Value::Object(map) => map.clone(),
         _ => {
@@ -196,54 +202,101 @@ fn json_to_template_data(value: &Value) -> Map<String, Value> {
     }
 }
 
-async fn load_config(path: &str) -> Result<Config, Box<dyn std::error::Error>> {
-    let content = tokio::fs::read_to_string(path).await?;
-    let config: Config = serde_yaml::from_str(&content)?;
-    Ok(config)
+fn init_logging(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
+    let env_filter = EnvFilter::try_from_default_env()
+        .or_else(|_| EnvFilter::try_new(&args.log_level))?;
+
+    match args.log_format.as_str() {
+        "json" => {
+            tracing_subscriber::registry()
+                .with(env_filter)
+                .with(tracing_subscriber::fmt::layer().json())
+                .init();
+        }
+        _ => {
+            tracing_subscriber::registry()
+                .with(env_filter)
+                .with(tracing_subscriber::fmt::layer().pretty())
+                .init();
+        }
+    }
+
+    Ok(())
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Initialize tracing
-    tracing_subscriber::fmt::init();
+    // Load environment variables from .env file if present
+    dotenvy::dotenv().ok();
 
-    // Load configuration
-    let config = load_config("config.yml").await?;
-    println!(
-        "Loaded configuration with {} webhook registers",
-        config.registers.len()
+    // Parse command line arguments and environment variables
+    let args = Args::parse();
+
+    // Initialize structured logging
+    init_logging(&args)?;
+
+    info!(
+        service = "hermes-rs",
+        version = env!("CARGO_PKG_VERSION"),
+        "Starting webhook proxy server"
     );
 
-    // Print registered endpoints
+    // Load configuration
+    let config = Config::load(&args.config).await?;
+    info!(
+        config_path = %args.config.display(),
+        webhook_count = config.registers.len(),
+        "Loaded configuration"
+    );
+
+    // Log registered endpoints
     for register in &config.registers {
-        println!(
-            "Registered: {} {} -> {} {}",
-            register.method, register.endpoint, register.target.method, register.target.url
+        info!(
+            method = %register.method,
+            endpoint = %register.endpoint,
+            target_method = %register.target.method,
+            target_url = %register.target.url,
+            "Registered webhook endpoint"
         );
     }
 
     // Create application state
-    let state = AppState::new(config);
+    let state = AppState::new(config, &args);
 
-    // Build the router
-    let app = Router::new()
+    // Build the router with health checks
+    let mut app = Router::new()
         .route("/*path", any(handle_webhook))
-        .route("/debug", axum::routing::post(handle_debug_request)) // Add debug route
+        .route("/debug", axum::routing::post(handle_debug_request))
         .layer(ServiceBuilder::new().layer(TraceLayer::new_for_http()))
         .with_state(state);
 
-    let ip = "0.0.0.0";
-    let port = "3000";
-    let addr = format!("{}:{}", ip, port);
+    // Add health check endpoints if enabled
+    if args.health_check_enabled {
+        app = app
+            .route("/health", get(health::health_check))
+            .route("/ready", get(health::readiness_check));
+        info!("Health check endpoints enabled");
+    }
+
+    let addr = format!("{}:{}", args.bind_address, args.port);
 
     // Start the server
-    println!("Webhook proxy server running on http://{}", addr);
-    let listener = TcpListener::bind(addr).await.unwrap();
+    info!(
+        bind_address = %args.bind_address,
+        port = args.port,
+        addr = %addr,
+        "Starting webhook proxy server"
+    );
+
+    let listener = TcpListener::bind(&addr).await?;
+    
+    info!("Webhook proxy server is ready to accept connections");
+    
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
-        .await
-        .unwrap();
+        .await?;
 
+    info!("Server shutdown complete");
     Ok(())
 }
 

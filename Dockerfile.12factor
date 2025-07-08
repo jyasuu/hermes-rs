@@ -1,0 +1,52 @@
+# Multi-stage build following 12-factor principles
+FROM rust:1.85.1 AS builder
+
+# Create app user for security
+RUN adduser --disabled-password --gecos '' --uid 1000 appuser
+
+WORKDIR /usr/src/app
+
+# Cache dependencies
+COPY Cargo.toml Cargo.lock ./
+RUN mkdir src && echo "fn main() {}" > src/main.rs
+RUN cargo build --release && rm -rf src
+
+# Copy source and build
+COPY src ./src
+RUN touch src/main.rs && cargo build --release
+
+# Runtime stage - minimal image
+FROM debian:bookworm-slim
+
+# Install runtime dependencies
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+    ca-certificates \
+    libssl3 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create non-root user
+RUN adduser --disabled-password --gecos '' --uid 1000 appuser
+
+# Set working directory
+WORKDIR /app
+
+# Copy binary from builder
+COPY --from=builder /usr/src/app/target/release/hermes-rs ./hermes-rs
+
+# Copy default config (can be overridden via volume mount)
+COPY config.yml ./config.yml
+
+# Change ownership to app user
+RUN chown -R appuser:appuser /app
+USER appuser
+
+# Expose port (configurable via environment)
+EXPOSE 3000
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+    CMD curl -f http://localhost:3000/health || exit 1
+
+# Use exec form for proper signal handling
+ENTRYPOINT ["./hermes-rs"]

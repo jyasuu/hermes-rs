@@ -1,0 +1,62 @@
+version: '3.8'
+
+services:
+  hermes-rs:
+    build:
+      context: .
+      dockerfile: Dockerfile.12factor
+    ports:
+      - "${HERMES_PORT:-3000}:3000"
+    environment:
+      # III. Config - Store config in environment
+      - HERMES_BIND_ADDRESS=0.0.0.0
+      - HERMES_PORT=3000
+      - HERMES_LOG_LEVEL=${HERMES_LOG_LEVEL:-info}
+      - HERMES_LOG_FORMAT=${HERMES_LOG_FORMAT:-json}
+      - HERMES_REQUEST_TIMEOUT=${HERMES_REQUEST_TIMEOUT:-30}
+      - HERMES_HEALTH_CHECK_ENABLED=true
+      # IV. Backing services - Treat backing services as attached resources
+      - DATABASE_URL=${DATABASE_URL:-}
+      - REDIS_URL=${REDIS_URL:-}
+    volumes:
+      # Mount config as volume for easy updates
+      - ./config.yml:/app/config.yml:ro
+      # XI. Logs - Treat logs as event streams
+      - /dev/stdout:/dev/stdout
+      - /dev/stderr:/dev/stderr
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    # IX. Disposability - Maximize robustness with fast startup and graceful shutdown
+    stop_grace_period: 30s
+    
+  # Example backing services
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    restart: unless-stopped
+    
+  prometheus:
+    image: prom/prometheus:latest
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/etc/prometheus/console_libraries'
+      - '--web.console.templates=/etc/prometheus/consoles'
+    restart: unless-stopped
+
+volumes:
+  redis_data:
+  prometheus_data:
