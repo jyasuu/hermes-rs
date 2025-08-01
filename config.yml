@@ -8,7 +8,7 @@ registers:
         Content-Type: application/json
         X-Custom-Header: "hermes-rs"
     template: |
-      {"msg": "Hello {{ key1 }}"}
+      {"msg": "Hello {{ escapeNewlines message }}"}
 
   - endpoint: /webhook/github
     method: POST

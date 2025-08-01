@@ -6,7 +6,8 @@ use axum::{
     Router,
 };
 use clap::Parser;
-use handlebars::Handlebars;
+use handlebars::{Helper, Handlebars, Context, RenderContext, Output, HelperResult};
+
 use reqwest::Client;
 use serde::Serialize;
 use serde_json::{Map, Value};
@@ -41,6 +42,7 @@ impl AppState {
     fn new(config: Config, args: &Args) -> Self {
         let mut registers = HashMap::new();
         let mut handlebars = Handlebars::new();
+        handlebars.register_helper("escapeNewlines", Box::new(escape_newlines_helper));
 
         // Register templates and build endpoint map
         for (index, register) in config.registers.iter().enumerate() {
@@ -120,14 +122,14 @@ async fn handle_webhook(
         })?;
 
     // Parse the rendered payload as JSON to validate it
-    // let payload_json: Value = serde_json::from_str(&rendered_payload).map_err(|e| {
-    //     (
-    //         StatusCode::INTERNAL_SERVER_ERROR,
-    //         Json(ErrorResponse {
-    //             error: format!("Rendered template is not valid JSON: {}", e),
-    //         }),
-    //     )
-    // })?;
+    let payload_json: Value = serde_json::from_str(&rendered_payload).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: format!("Rendered template is not valid JSON: {}", e),
+            }),
+        )
+    })?;
 
     // Send request to target
     let method = register.target.method.to_uppercase();
@@ -161,7 +163,7 @@ async fn handle_webhook(
 
     let response = request_builder
         .headers(headers)
-        .body(rendered_payload)
+        .json(&payload_json)
         .send()
         .await
         .map_err(|e| {
@@ -237,6 +239,22 @@ fn init_logging(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
 
     Ok(())
 }
+
+fn escape_newlines_helper(
+    h: &Helper,
+    _: &Handlebars,
+    _: &Context,
+    _: &mut RenderContext,
+    out: &mut dyn Output,
+) -> HelperResult {
+    if let Some(param) = h.param(0) {
+        let raw = param.value().as_str().unwrap_or("");
+        let escaped = raw.replace('\n', "\\n");
+        out.write(&escaped)?;
+    }
+    Ok(())
+}
+
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
