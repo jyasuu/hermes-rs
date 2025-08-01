@@ -8,20 +8,20 @@ use axum::{
 use clap::Parser;
 use handlebars::Handlebars;
 use reqwest::Client;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use serde_json::{Map, Value};
 use std::{collections::HashMap, sync::Arc, time::Duration};
 use tokio::net::TcpListener;
 use tower::ServiceBuilder;
 use tower_http::trace::TraceLayer;
-use tracing::{info, error, warn};
+use tracing::{info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
 pub mod config;
 pub mod health;
 pub mod admin;
 
-use config::{Args, Config, WebhookRegister, Target};
+use config::{Args, Config, WebhookRegister};
 
 
 #[derive(Debug, Serialize)]
@@ -120,14 +120,14 @@ async fn handle_webhook(
         })?;
 
     // Parse the rendered payload as JSON to validate it
-    let payload_json: Value = serde_json::from_str(&rendered_payload).map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                error: format!("Rendered template is not valid JSON: {}", e),
-            }),
-        )
-    })?;
+    // let payload_json: Value = serde_json::from_str(&rendered_payload).map_err(|e| {
+    //     (
+    //         StatusCode::INTERNAL_SERVER_ERROR,
+    //         Json(ErrorResponse {
+    //             error: format!("Rendered template is not valid JSON: {}", e),
+    //         }),
+    //     )
+    // })?;
 
     // Send request to target
     let method = register.target.method.to_uppercase();
@@ -161,7 +161,7 @@ async fn handle_webhook(
 
     let response = request_builder
         .headers(headers)
-        .json(&payload_json)
+        .json(&rendered_payload)
         .send()
         .await
         .map_err(|e| {
