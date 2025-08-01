@@ -4,6 +4,9 @@ registers:
     target:
       url: http://localhost:3000/debug
       method: POST
+      headers:
+        Content-Type: application/json
+        X-Custom-Header: "hermes-rs"
     template: |
       {"msg": "Hello {{ key1 }}"}
 

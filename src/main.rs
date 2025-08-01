@@ -147,8 +147,20 @@ async fn handle_webhook(
         }
     };
 
+    let mut headers = reqwest::header::HeaderMap::new();
+    for (key, value) in &register.target.headers {
+        let header_name = reqwest::header::HeaderName::from_bytes(key.as_bytes())
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: format!("Invalid header name: {}: {}", key, e) })))?;
+        let header_value = reqwest::header::HeaderValue::from_str(value)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: format!("Invalid header value for {}: {}", key, e) })))?;
+        headers.insert(header_name, header_value);
+    }
+    if !headers.contains_key(reqwest::header::CONTENT_TYPE) {
+        headers.insert(reqwest::header::CONTENT_TYPE, "application/json".parse().unwrap());
+    }
+
     let response = request_builder
-        .header("Content-Type", "application/json")
+        .headers(headers)
         .json(&payload_json)
         .send()
         .await
@@ -183,8 +195,10 @@ async fn handle_webhook(
 
 // New handler for debug endpoint
 async fn handle_debug_request(
+    headers: axum::http::HeaderMap,
     body: String,
 ) -> Result<Json<Value>, (StatusCode, Json<ErrorResponse>)> {
+    tracing::info!("Debug request headers: {:?}", headers);
     tracing::info!("Debug request payload: {}", body);
     Ok(Json(
         serde_json::json!({"status": "success", "message": "Payload logged"}),
