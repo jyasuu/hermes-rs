@@ -161,7 +161,7 @@ async fn handle_webhook(
 
     let response = request_builder
         .headers(headers)
-        .json(&rendered_payload)
+        .body(rendered_payload)
         .send()
         .await
         .map_err(|e| {
