@@ -92,9 +92,15 @@ pub struct RetryConfig {
     pub backoff_multiplier: f64,
 }
 
-fn default_retry_attempts() -> u32 { 3 }
-fn default_retry_delay_ms() -> u64 { 1000 }
-fn default_enable_metrics() -> bool { false }
+fn default_retry_attempts() -> u32 {
+    3
+}
+fn default_retry_delay_ms() -> u64 {
+    1000
+}
+fn default_enable_metrics() -> bool {
+    false
+}
 
 impl Config {
     pub async fn load(path: &PathBuf) -> Result<Self, Box<dyn std::error::Error>> {

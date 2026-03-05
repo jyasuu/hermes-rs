@@ -1,6 +1,6 @@
+pub mod admin;
 pub mod config;
 pub mod health;
-pub mod admin;
 
 pub use config::*;
 pub use health::*;
@@ -16,5 +16,3 @@ pub fn json_to_template_data(value: &Value) -> Map<String, Value> {
         }
     }
 }
-
-
