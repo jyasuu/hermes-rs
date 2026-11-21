@@ -1,5 +1,5 @@
 # Multi-stage build following 12-factor principles
-FROM rust:1.85.1 AS builder
+FROM rust:1.91 AS builder
 
 # Create app user for security
 RUN adduser --disabled-password --gecos '' --uid 1000 appuser

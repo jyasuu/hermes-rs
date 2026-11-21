@@ -2,6 +2,7 @@
 name = "hermes-rs"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.89"
 
 [dependencies]
 # Web framework
@@ -28,6 +29,10 @@ tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
 # Environment and configuration
 dotenvy = "0.15"
 clap = { version = "4.4", features = ["derive", "env"] }
+lapin = "4.12.3"
+async-nats = "0.53.0"
+futures-util = "0.3.34"
+bytes = "1.12.2"
 
 [dev-dependencies]
 tempfile = "3.8"

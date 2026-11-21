@@ -63,33 +63,7 @@ async fn validate_config(config_path: &PathBuf) -> Result<(), Box<dyn std::error
     let config = Config::load(config_path).await?;
 
     info!("Validating {} webhook registers", config.registers.len());
-
-    // Validate each register
-    for (i, register) in config.registers.iter().enumerate() {
-        // Check endpoint format
-        if !register.endpoint.starts_with('/') {
-            return Err(format!("Register {}: endpoint must start with '/'", i).into());
-        }
-
-        // Check HTTP method
-        let valid_methods = ["GET", "POST", "PUT", "DELETE", "PATCH"];
-        if !valid_methods.contains(&register.method.to_uppercase().as_str()) {
-            return Err(
-                format!("Register {}: invalid HTTP method '{}'", i, register.method).into(),
-            );
-        }
-
-        // Check target URL
-        if register.target.url.is_empty() {
-            return Err(format!("Register {}: target URL cannot be empty", i).into());
-        }
-
-        // Validate template by trying to compile it
-        let mut handlebars = handlebars::Handlebars::new();
-        handlebars
-            .register_template_string("test", &register.template)
-            .map_err(|e| format!("Register {}: template error: {}", i, e))?;
-    }
+    config.validate()?;
 
     Ok(())
 }
@@ -110,21 +84,27 @@ async fn test_template(
 
     // Parse the payload
     let payload_json: serde_json::Value = serde_json::from_str(payload)?;
-
-    // Create template data
     let template_data = crate::json_to_template_data(&payload_json);
 
-    // Render template
-    let mut handlebars = handlebars::Handlebars::new();
-    handlebars.register_template_string("test", &register.template)?;
-    let rendered = handlebars.render("test", &template_data)?;
+    // Render the register template, then every per-target override.
+    let mut to_render: Vec<(String, &str)> = vec![("default template".to_string(), &register.template)];
+    for (j, t) in register.all_targets().enumerate() {
+        if let Some(tpl) = &t.template {
+            to_render.push((format!("target '{}' ({})", t.label(j), t.type_name()), tpl));
+        }
+    }
 
-    println!("📝 Template rendered successfully:");
-    println!("{}", rendered);
+    let hbs = crate::template::new_handlebars();
+    for (label, tpl) in to_render {
+        let rendered = hbs.render_template(tpl, &template_data)?;
 
-    // Validate that rendered output is valid JSON
-    let _: serde_json::Value = serde_json::from_str(&rendered)?;
-    println!("✅ Rendered output is valid JSON");
+        println!("📝 {} rendered successfully:", label);
+        println!("{}", rendered);
+
+        // Validate that rendered output is valid JSON
+        let _: serde_json::Value = serde_json::from_str(&rendered)?;
+        println!("✅ Rendered output is valid JSON");
+    }
 
     Ok(())
 }
@@ -134,16 +114,25 @@ async fn list_endpoints(config_path: &PathBuf) -> Result<(), Box<dyn std::error:
 
     println!("📋 Registered webhook endpoints:");
     println!(
-        "{:<8} {:<30} {:<8} {}",
-        "METHOD", "ENDPOINT", "TARGET", "URL"
+        "{:<8} {:<28} {:<10} {:<14} {}",
+        "METHOD", "ENDPOINT", "TYPE", "TARGET", "DESTINATION"
     );
-    println!("{}", "-".repeat(80));
+    println!("{}", "-".repeat(100));
 
     for register in &config.registers {
-        println!(
-            "{:<8} {:<30} {:<8} {}",
-            register.method, register.endpoint, register.target.method, register.target.url
-        );
+        for (j, target) in register.all_targets().enumerate() {
+            println!(
+                "{:<8} {:<28} {:<10} {:<14} {}",
+                register.method,
+                register.endpoint,
+                target.type_name(),
+                target.label(j),
+                target.describe()
+            );
+        }
+        if register.all_targets().count() > 1 {
+            println!("{:<8} {:<28} ↳ broadcast, delivery={:?}", "", "", register.delivery);
+        }
     }
 
     Ok(())

@@ -1,0 +1,64 @@
+registers:
+  # Legacy syntax, no `type:` — must behave exactly as before
+  - endpoint: /webhook/legacy
+    method: POST
+    target:
+      url: http://127.0.0.1:3000/debug
+      method: POST
+      headers: { X-Custom-Header: "hermes-rs" }
+    template: '{"msg": "Hello {{ escapeNewlines message }}"}'
+
+  # Full broadcast: http + rabbitmq (fanout exchange + bound queue) + nats core + jetstream
+  - endpoint: /webhook/fan
+    method: POST
+    template: '{"event": "{{ action }}", "who": "{{ user }}"}'
+    targets:
+      - { name: audit-http, url: "http://127.0.0.1:3000/debug" }
+      - name: rmq-fanout
+        type: rabbitmq
+        url: "amqp://guest:guest@127.0.0.1:5672/%2f"
+        exchange: hermes.events
+        exchange_type: fanout
+        queue: hermes.events.q
+        headers: { X-Source: hermes }
+      - name: rmq-direct-queue
+        type: rabbitmq
+        url: "amqp://guest:guest@127.0.0.1:5672/%2f"
+        routing_key: hermes.direct.q
+        queue: hermes.direct.q
+        persistent: false
+      - { name: nats-core, type: nats, url: "nats://127.0.0.1:4222", subject: hooks.fan, headers: { X-Source: hermes } }
+      - name: nats-js
+        type: nats
+        url: "nats://127.0.0.1:4222"
+        subject: js.fan
+        jetstream: true
+        template: '{"js": true, "event": "{{ action }}"}'
+
+  # delivery: any — one dead target, one healthy => 200 "partial"
+  - endpoint: /webhook/any
+    method: POST
+    delivery: any
+    template: '{"n": 1}'
+    targets:
+      - { name: dead, url: "http://127.0.0.1:9/nope", timeout_seconds: 2 }
+      - { name: alive, type: nats, url: "nats://127.0.0.1:4222", subject: hooks.any }
+
+  # delivery: all (default) — same mix => 502
+  - endpoint: /webhook/all
+    method: POST
+    template: '{"n": 1}'
+    targets:
+      - { name: dead, url: "http://127.0.0.1:9/nope", timeout_seconds: 2 }
+      - { name: alive, type: nats, url: "nats://127.0.0.1:4222", subject: hooks.all }
+
+  # mandatory publish to an exchange with no bound queue => unroutable => failure
+  - endpoint: /webhook/unroutable
+    method: POST
+    template: '{"n": 1}'
+    target:
+      type: rabbitmq
+      url: "amqp://guest:guest@127.0.0.1:5672/%2f"
+      exchange: hermes.nowhere
+      exchange_type: direct
+      routing_key: nothing

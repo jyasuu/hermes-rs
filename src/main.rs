@@ -6,22 +6,21 @@ use axum::{
     Router,
 };
 use clap::Parser;
-use handlebars::{Context, Handlebars, Helper, HelperResult, Output, RenderContext};
-use reqwest::Client;
+use handlebars::Handlebars;
+use hermes_rs::{
+    config::{Args, Config, DeliveryPolicy, Target},
+    health,
+    sink::{BroadcastReport, Delivery, Dispatcher},
+    template::{json_to_template_data, new_handlebars},
+};
 use serde::Serialize;
-use serde_json::{Map, Value};
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use serde_json::Value;
+use std::{collections::HashMap, sync::Arc};
 use tokio::net::TcpListener;
 use tower::ServiceBuilder;
 use tower_http::trace::TraceLayer;
 use tracing::{info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
-
-pub mod admin;
-pub mod config;
-pub mod health;
-
-use config::{Args, Config, WebhookRegister};
 
 // ---------------------------------------------------------------------------
 // Domain types
@@ -54,122 +53,69 @@ type ApiError = (StatusCode, Json<ErrorResponse>);
 type ApiResult<T> = Result<T, ApiError>;
 
 // ---------------------------------------------------------------------------
-// JSON string escaping  (Single Responsibility)
-// ---------------------------------------------------------------------------
-
-/// Escapes a raw string so it is safe to embed inside a JSON string literal.
-/// Covers all U+0000–U+001F control characters as required by RFC 8259.
-pub fn escape_json_string(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for ch in s.chars() {
-        match ch {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            '\x08' => out.push_str("\\b"), // backspace
-            '\x0C' => out.push_str("\\f"), // form feed
-            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04X}", c as u32)),
-            c => out.push(c),
-        }
-    }
-    out
-}
-
-/// Handlebars helper that delegates to `escape_json_string`.
-/// Usage in templates: `{{jsonEscape someField}}`
-pub fn json_escape_helper(
-    h: &Helper,
-    _: &Handlebars,
-    _: &Context,
-    _: &mut RenderContext,
-    out: &mut dyn Output,
-) -> HelperResult {
-    if let Some(param) = h.param(0) {
-        let raw = param.value().as_str().unwrap_or("");
-        out.write(&escape_json_string(raw))?;
-    }
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// Template engine factory  (Open/Closed — add helpers without touching state)
-// ---------------------------------------------------------------------------
-
-/// Builds a `Handlebars` instance pre-loaded with all application helpers
-/// and the templates from `registers`.
-fn build_handlebars(registers: &[(String, &WebhookRegister)]) -> Handlebars<'static> {
-    let mut hbs = Handlebars::new();
-
-    // Register helpers here — adding a new helper never touches other code.
-    hbs.register_helper("jsonEscape", Box::new(json_escape_helper));
-    // Backward-compat alias so existing templates keep working.
-    hbs.register_helper("escapeNewlines", Box::new(json_escape_helper));
-
-    for (template_name, register) in registers {
-        hbs.register_template_string(template_name, &register.template)
-            .unwrap_or_else(|e| panic!("Failed to register template '{}': {}", template_name, e));
-    }
-
-    hbs
-}
-
-// ---------------------------------------------------------------------------
-// HTTP client factory  (Single Responsibility)
-// ---------------------------------------------------------------------------
-
-fn build_http_client(timeout_secs: u64) -> Client {
-    Client::builder()
-        .timeout(Duration::from_secs(timeout_secs))
-        .build()
-        .expect("Failed to create HTTP client")
-}
-
-// ---------------------------------------------------------------------------
 // Application state
 // ---------------------------------------------------------------------------
 
-#[derive(Clone)]
-struct AppState {
-    /// Maps endpoint path → register config (with template name substituted).
-    registers: HashMap<String, WebhookRegister>,
-    handlebars: Arc<Handlebars<'static>>,
-    http_client: Client,
-    config: Config,
+/// A target plus the name of the template compiled for it.
+struct CompiledTarget {
+    label: String,
+    target: Target,
+    /// `Some` when the target overrides the register's template.
+    own_template: Option<String>,
 }
 
+struct CompiledRegister {
+    delivery: DeliveryPolicy,
+    default_template: String,
+    targets: Vec<CompiledTarget>,
+}
+
+struct Inner {
+    registers: HashMap<String, CompiledRegister>,
+    handlebars: Handlebars<'static>,
+    dispatcher: Dispatcher,
+}
+
+/// Cheap to clone: axum clones state for every request.
+#[derive(Clone)]
+struct AppState(Arc<Inner>);
+
 impl AppState {
-    fn new(config: Config, args: &Args) -> Self {
-        // Build (template_name, register) pairs first so we can pass them to
-        // `build_handlebars` without borrowing issues.
-        let named: Vec<(String, WebhookRegister)> = config
-            .registers
-            .iter()
-            .enumerate()
-            .map(|(i, r)| (format!("template_{}", i), r.clone()))
-            .collect();
+    /// Compiles every template up front. `Config::validate` must have run.
+    fn new(config: &Config, args: &Args) -> Self {
+        let mut hbs = new_handlebars();
+        let mut registers = HashMap::new();
 
-        let hbs_input: Vec<(String, &WebhookRegister)> =
-            named.iter().map(|(n, r)| (n.clone(), r)).collect();
+        for (i, reg) in config.registers.iter().enumerate() {
+            let default_template = format!("reg{i}");
+            hbs.register_template_string(&default_template, &reg.template)
+                .unwrap_or_else(|e| panic!("Failed to register template '{default_template}': {e}"));
 
-        let handlebars = build_handlebars(&hbs_input);
+            let targets = reg
+                .all_targets()
+                .enumerate()
+                .map(|(j, t)| {
+                    let own_template = t.template.as_ref().map(|tpl| {
+                        let name = format!("reg{i}_t{j}");
+                        hbs.register_template_string(&name, tpl)
+                            .unwrap_or_else(|e| panic!("Failed to register template '{name}': {e}"));
+                        name
+                    });
+                    CompiledTarget { label: t.label(j), target: t.clone(), own_template }
+                })
+                .collect();
 
-        let registers: HashMap<String, WebhookRegister> = named
-            .into_iter()
-            .map(|(template_name, mut r)| {
-                let endpoint = r.endpoint.clone();
-                r.template = template_name;
-                (endpoint, r)
-            })
-            .collect();
-
-        Self {
-            registers,
-            handlebars: Arc::new(handlebars),
-            http_client: build_http_client(args.request_timeout),
-            config,
+            registers.insert(
+                reg.endpoint.clone(),
+                CompiledRegister { delivery: reg.delivery, default_template, targets },
+            );
         }
+
+        AppState(Arc::new(Inner {
+            registers,
+            handlebars: hbs,
+            dispatcher: Dispatcher::new(args.request_timeout),
+        }))
     }
 }
 
@@ -180,88 +126,14 @@ impl AppState {
 fn render_template(
     handlebars: &Handlebars,
     template_name: &str,
-    data: &Map<String, Value>,
-) -> ApiResult<Value> {
+    data: &serde_json::Map<String, Value>,
+) -> Result<Value, String> {
     let rendered = handlebars
         .render(template_name, data)
-        .map_err(|e| ErrorResponse::internal(format!("Template rendering failed: {}", e)))?;
+        .map_err(|e| format!("Template rendering failed: {e}"))?;
 
     serde_json::from_str(&rendered)
-        .map_err(|e| ErrorResponse::internal(format!("Rendered template is not valid JSON: {}", e)))
-}
-
-// ---------------------------------------------------------------------------
-// HTTP forwarding  (Single Responsibility)
-// ---------------------------------------------------------------------------
-
-fn build_request_builder(
-    client: &Client,
-    method: &str,
-    url: &str,
-) -> ApiResult<reqwest::RequestBuilder> {
-    let builder = match method.to_uppercase().as_str() {
-        "GET" => client.get(url),
-        "POST" => client.post(url),
-        "PUT" => client.put(url),
-        "DELETE" => client.delete(url),
-        "PATCH" => client.patch(url),
-        other => {
-            return Err(ErrorResponse::internal(format!(
-                "Unsupported HTTP method: {}",
-                other
-            )))
-        }
-    };
-    Ok(builder)
-}
-
-fn build_header_map(
-    raw_headers: &HashMap<String, String>,
-) -> ApiResult<reqwest::header::HeaderMap> {
-    let mut map = reqwest::header::HeaderMap::new();
-
-    for (key, value) in raw_headers {
-        let name = reqwest::header::HeaderName::from_bytes(key.as_bytes()).map_err(|e| {
-            ErrorResponse::internal(format!("Invalid header name '{}': {}", key, e))
-        })?;
-        let val = reqwest::header::HeaderValue::from_str(value).map_err(|e| {
-            ErrorResponse::internal(format!("Invalid header value for '{}': {}", key, e))
-        })?;
-        map.insert(name, val);
-    }
-
-    if !map.contains_key(reqwest::header::CONTENT_TYPE) {
-        map.insert(
-            reqwest::header::CONTENT_TYPE,
-            "application/json".parse().unwrap(),
-        );
-    }
-
-    Ok(map)
-}
-
-async fn forward_request(
-    client: &Client,
-    register: &WebhookRegister,
-    payload: &Value,
-) -> ApiResult<Value> {
-    let builder = build_request_builder(client, &register.target.method, &register.target.url)?;
-    let headers = build_header_map(&register.target.headers)?;
-
-    let response = builder
-        .headers(headers)
-        .json(payload)
-        .send()
-        .await
-        .map_err(|e| ErrorResponse::internal(format!("Failed to send request to target: {}", e)))?;
-
-    let text = response
-        .text()
-        .await
-        .map_err(|e| ErrorResponse::internal(format!("Failed to read target response: {}", e)))?;
-
-    // Return parsed JSON when possible, otherwise a plain string.
-    Ok(serde_json::from_str::<Value>(&text).unwrap_or_else(|_| Value::String(text)))
+        .map_err(|e| format!("Rendered template is not valid JSON: {e}"))
 }
 
 // ---------------------------------------------------------------------------
@@ -272,29 +144,88 @@ async fn handle_webhook(
     State(state): State<AppState>,
     Path(path): Path<String>,
     body: String,
-) -> ApiResult<Json<Value>> {
+) -> ApiResult<(StatusCode, Json<Value>)> {
     let endpoint = format!("/{}", path);
 
     info!(endpoint = %endpoint, payload_size = body.len(), "Processing webhook request");
 
-    let register = state.registers.get(&endpoint).ok_or_else(|| {
+    let register = state.0.registers.get(&endpoint).ok_or_else(|| {
         warn!(endpoint = %endpoint, "Webhook endpoint not found");
         ErrorResponse::not_found("Endpoint not found")
     })?;
 
     let request_data: Value = serde_json::from_str(&body)
         .map_err(|e| ErrorResponse::bad_request(format!("Invalid JSON: {}", e)))?;
-
     let template_data = json_to_template_data(&request_data);
 
-    let payload_json = render_template(&state.handlebars, &register.template, &template_data)?;
+    // Render the register-level template once and share it between all
+    // targets that don't bring their own.
+    let default_payload = render_template(&state.0.handlebars, &register.default_template, &template_data);
+    if let Err(e) = &default_payload {
+        if register.targets.iter().all(|t| t.own_template.is_none()) {
+            return Err(ErrorResponse::internal(e.clone()));
+        }
+    }
 
-    let target_response = forward_request(&state.http_client, register, &payload_json).await?;
+    let deliveries: Vec<Delivery> = register
+        .targets
+        .iter()
+        .map(|t| Delivery {
+            label: t.label.clone(),
+            target: &t.target,
+            payload: match &t.own_template {
+                Some(name) => render_template(&state.0.handlebars, name, &template_data),
+                None => default_payload.clone(),
+            },
+        })
+        .collect();
 
-    Ok(Json(serde_json::json!({
-        "status": "success",
-        "target_response": target_response,
-    })))
+    let total = deliveries.len();
+    let outcomes = state.0.dispatcher.broadcast(deliveries).await;
+    let report = BroadcastReport::new(register.delivery, outcomes);
+
+    for r in &report.results {
+        match &r.error {
+            None => info!(endpoint = %endpoint, target = %r.target, kind = r.kind, elapsed_ms = r.elapsed_ms, "Delivered"),
+            Some(err) => warn!(endpoint = %endpoint, target = %r.target, kind = r.kind, elapsed_ms = r.elapsed_ms, error = %err, "Delivery failed"),
+        }
+    }
+
+    let status_text = if report.ok == total {
+        "success"
+    } else if report.satisfied && report.ok > 0 {
+        "partial"
+    } else {
+        "failed"
+    };
+
+    let mut resp = serde_json::json!({
+        "status": status_text,
+        "delivered": report.ok,
+        "total": report.total,
+        "results": report.results,
+    });
+
+    // Backward compatibility: the original single-target response shape.
+    if total == 1 {
+        if let Some(r) = report.results[0].response.clone() {
+            resp["target_response"] = r;
+        }
+    }
+
+    if !report.satisfied {
+        resp["error"] = Value::String(
+            report
+                .results
+                .iter()
+                .filter_map(|r| r.error.as_ref().map(|e| format!("{}: {}", r.target, e)))
+                .collect::<Vec<_>>()
+                .join("; "),
+        );
+        return Ok((StatusCode::BAD_GATEWAY, Json(resp)));
+    }
+
+    Ok((StatusCode::OK, Json(resp)))
 }
 
 async fn handle_debug_request(
@@ -306,21 +237,6 @@ async fn handle_debug_request(
     Ok(Json(
         serde_json::json!({"status": "success", "message": "Payload logged"}),
     ))
-}
-
-// ---------------------------------------------------------------------------
-// Utilities
-// ---------------------------------------------------------------------------
-
-pub fn json_to_template_data(value: &Value) -> Map<String, Value> {
-    match value {
-        Value::Object(map) => map.clone(),
-        _ => {
-            let mut result = Map::new();
-            result.insert("data".to_string(), value.clone());
-            result
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -394,17 +310,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "Loaded configuration"
     );
 
+    config.validate().map_err(|e| format!("Invalid configuration: {e}"))?;
+
     for register in &config.registers {
-        info!(
-            method = %register.method,
-            endpoint = %register.endpoint,
-            target_method = %register.target.method,
-            target_url = %register.target.url,
-            "Registered webhook endpoint"
-        );
+        for (j, target) in register.all_targets().enumerate() {
+            info!(
+                method = %register.method,
+                endpoint = %register.endpoint,
+                target = %target.label(j),
+                kind = target.type_name(),
+                destination = %target.describe(),
+                delivery = ?register.delivery,
+                "Registered webhook endpoint"
+            );
+        }
     }
 
-    let state = AppState::new(config, &args);
+    let state = AppState::new(&config, &args);
     let app = build_router(state, &args);
 
     let addr = format!("{}:{}", args.bind_address, args.port);
@@ -442,87 +364,5 @@ async fn shutdown_signal() {
     tokio::select! {
         _ = ctrl_c => {},
         _ = terminate => {},
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    // --- escape_json_string ---
-
-    #[test]
-    fn test_escape_newline() {
-        assert_eq!(escape_json_string("a\nb"), "a\\nb");
-    }
-
-    #[test]
-    fn test_escape_tab() {
-        assert_eq!(escape_json_string("a\tb"), "a\\tb");
-    }
-
-    #[test]
-    fn test_escape_carriage_return() {
-        assert_eq!(escape_json_string("a\rb"), "a\\rb");
-    }
-
-    #[test]
-    fn test_escape_backslash() {
-        assert_eq!(escape_json_string("a\\b"), "a\\\\b");
-    }
-
-    #[test]
-    fn test_escape_double_quote() {
-        assert_eq!(escape_json_string("say \"hi\""), "say \\\"hi\\\"");
-    }
-
-    #[test]
-    fn test_escape_null_control_char() {
-        assert_eq!(escape_json_string("\x00"), "\\u0000");
-    }
-
-    #[test]
-    fn test_escape_other_control_char() {
-        // U+001B = ESC
-        assert_eq!(escape_json_string("\x1B"), "\\u001B");
-    }
-
-    #[test]
-    fn test_escape_plain_string_unchanged() {
-        assert_eq!(escape_json_string("hello world"), "hello world");
-    }
-
-    #[test]
-    fn test_escape_combined() {
-        let input = "line1\nline2\ttabbed\r\n\"quoted\"";
-        let expected = "line1\\nline2\\ttabbed\\r\\n\\\"quoted\\\"";
-        assert_eq!(escape_json_string(input), expected);
-    }
-
-    // --- json_to_template_data ---
-
-    #[test]
-    fn test_json_to_template_data_object() {
-        let json = serde_json::json!({"name": "John", "age": 30});
-        let data = json_to_template_data(&json);
-        assert_eq!(data.get("name").unwrap(), &Value::String("John".into()));
-        assert_eq!(
-            data.get("age").unwrap(),
-            &Value::Number(serde_json::Number::from(30))
-        );
-    }
-
-    #[test]
-    fn test_json_to_template_data_non_object_wrapped() {
-        let json = serde_json::json!("just a string");
-        let data = json_to_template_data(&json);
-        assert_eq!(
-            data.get("data").unwrap(),
-            &Value::String("just a string".into())
-        );
     }
 }

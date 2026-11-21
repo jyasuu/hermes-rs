@@ -1,0 +1,40 @@
+# Example: one inbound webhook, broadcast to HTTP + RabbitMQ + NATS.
+# Run:  hermes-admin validate-config -c config.broadcast.example.yml
+registers:
+  - endpoint: /webhook/github
+    method: POST
+    # all (default): every target must succeed, otherwise 502
+    # any:           at least one must succeed
+    # best_effort:   always 200; inspect `results` in the response body
+    delivery: all
+    template: |
+      {"event": "{{ action }}", "repository": "{{ repository.name }}"}
+    targets:
+      - name: audit-log                # type defaults to http
+        url: http://audit.internal/ingest
+        headers: { Authorization: "Bearer change-me" }
+        timeout_seconds: 5
+
+      - name: events-bus
+        type: rabbitmq
+        url: amqp://guest:guest@rabbitmq:5672/%2f
+        exchange: hermes.events
+        exchange_type: topic           # declared (durable) on first use
+        routing_key: github.webhook
+        queue: hermes.github           # optional: declare + bind a durable queue
+        persistent: true
+        mandatory: true                # unroutable message => failure
+        headers: { X-Source: hermes }
+
+      - name: nats-fanout
+        type: nats
+        url: nats://nats:4222
+        subject: hooks.github
+
+      - name: nats-durable
+        type: nats
+        url: nats://nats:4222
+        subject: js.github             # must be captured by an existing stream
+        jetstream: true
+        template: |                    # per-target template override
+          {"kind": "github", "action": "{{ action }}"}

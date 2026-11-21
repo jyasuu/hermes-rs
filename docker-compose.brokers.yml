@@ -1,0 +1,11 @@
+# Local RabbitMQ + NATS (JetStream on) for development and tests/e2e.
+#   docker compose -f docker-compose.brokers.yml up -d
+#   python3 tests/e2e/setup_jetstream.py    # creates the HOOKS stream
+services:
+  rabbitmq:
+    image: rabbitmq:3.13-management-alpine
+    ports: ["5672:5672", "15672:15672"]   # AMQP, management UI (guest/guest)
+  nats:
+    image: nats:2.10-alpine
+    command: ["-js", "-sd", "/data"]
+    ports: ["4222:4222", "8222:8222"]
