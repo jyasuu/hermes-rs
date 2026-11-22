@@ -12,8 +12,12 @@ def post(path, body, headers=None):
 # ---- controllable HTTP target ------------------------------------------------
 SEEN = []          # (path, idempotency-key) for every request received
 COUNTS = {}        # path -> number of requests so far
+HEALTHY = {"dlq": False}
 class H(BaseHTTPRequestHandler):
     def log_message(self, *a): pass
+    def handle(self):
+        try: super().handle()
+        except (BrokenPipeError, ConnectionResetError): pass   # Hermes was killed on purpose mid-request
     def do_POST(self):
         self.rfile.read(int(self.headers.get("Content-Length", 0)))
         n = COUNTS[self.path] = COUNTS.get(self.path, 0) + 1
@@ -23,6 +27,9 @@ class H(BaseHTTPRequestHandler):
         elif self.path == "/perm": code = 400
         elif self.path == "/rl" and n == 1: code, extra = 429, {"Retry-After": "1"}
         elif self.path == "/always500": code = 500
+        elif self.path == "/aflaky" and n <= 2: code = 500
+        elif self.path == "/dlq" and not HEALTHY["dlq"]: code = 500
+        elif self.path == "/slow": time.sleep(1.5)
         body = json.dumps({"seen": n}).encode()
         self.send_response(code)
         for k, v in extra.items(): self.send_header(k, v)
@@ -33,20 +40,47 @@ def serve(port):
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     return srv
 
+ROOT = os.path.dirname(os.path.abspath(__file__))
+CFG = os.path.join(ROOT, "config.yml")
+OUTBOX = "/tmp/hermes-e2e-outbox/outbox.db"
+HERMES = {"p": None}
+def hermes_env():
+    return dict(os.environ, HERMES_CONFIG_PATH=CFG, HERMES_LOG_FORMAT="json", HERMES_LOG_LEVEL="info",
+                HERMES_OUTBOX_PATH=OUTBOX)
+def start_hermes():
+    HERMES["p"] = subprocess.Popen([os.environ.get("HERMES_BIN", "target/debug/hermes-rs")], env=hermes_env(),
+                                   stdout=open(os.environ.get("HERMES_E2E_LOG", "/tmp/hermes-e2e.log"), "a"),
+                                   stderr=subprocess.STDOUT)
+    for _ in range(100):
+        try: urllib.request.urlopen("http://127.0.0.1:3000/health", timeout=1); return
+        except Exception: time.sleep(0.1)
+    raise RuntimeError("hermes did not start")
+def kill_hermes():          # SIGKILL: no graceful shutdown, like a crash / OOM kill
+    HERMES["p"].kill(); HERMES["p"].wait(timeout=10)
+def admin(*args):
+    r = subprocess.run([os.environ.get("HERMES_ADMIN_BIN", "target/debug/hermes-admin"), "outbox", "-c", CFG, *args],
+                       env=hermes_env(), capture_output=True, text=True)
+    return r.returncode, r.stdout + r.stderr
+async def wait_for(pred, timeout=10, step=0.1):
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        if pred(): return True
+        await asyncio.sleep(step)
+    return pred()
+
 results = []
 def check(name, cond, extra=""):
     results.append(cond); print(("PASS " if cond else "FAIL ") + name + (f"  [{extra}]" if extra and not cond else ""))
 
 async def main():
+    for suffix in ("", "-wal", "-shm"):
+        try: os.remove(OUTBOX + suffix)
+        except FileNotFoundError: pass
+    os.makedirs(os.path.dirname(OUTBOX), exist_ok=True)
+    open(os.environ.get("HERMES_E2E_LOG", "/tmp/hermes-e2e.log"), "w").close()
     serve(3999)
-    env = dict(os.environ, HERMES_CONFIG_PATH=os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.yml"), HERMES_LOG_FORMAT="json", HERMES_LOG_LEVEL="info")
-    srv = subprocess.Popen([os.environ.get("HERMES_BIN", "target/debug/hermes-rs")], env=env,
-                           stdout=open(os.environ.get("HERMES_E2E_LOG", "/tmp/hermes-e2e.log"),"w"), stderr=subprocess.STDOUT)
+    start_hermes()
     try:
-        for _ in range(50):
-            try: urllib.request.urlopen("http://127.0.0.1:3000/health", timeout=1); break
-            except Exception: time.sleep(0.2)
-
         nc = await nats.connect("nats://127.0.0.1:4222")
         # Start from a clean slate so the suite is re-runnable.
         _js = nc.jetstream()
@@ -180,6 +214,89 @@ async def main():
         check("breaker: stays closed afterwards", s == 200, (s, r))
         bsrv.shutdown()
 
+
+        # ======================= async mode: durable outbox =======================
+        _c = pika.BlockingConnection(pika.ConnectionParameters("127.0.0.1")); _ch = _c.channel()
+        try: _ch.queue_delete("hermes.async.q")
+        except Exception: pass
+        _c.close()
+        got["async"] = []
+        await mk("hooks.async", "async"); await nc.flush()
+
+        t0 = time.time()
+        s, r = post("/webhook/async-fan", {"action": "opened"}, {"Idempotency-Key": "async-1"})
+        el = time.time() - t0
+        check("async: 202 accepted, 3 jobs queued", s == 202 and r["status"] == "accepted" and r["queued"] == 3 and r["duplicate"] is False, (s, r))
+        check("async: replies fast, before any delivery (<0.4s)", el < 0.4, el)
+        check("async: response echoes message_id", r.get("message_id") == "async-1", r)
+
+        ok = await wait_for(lambda: len(got["async"]) >= 1 and COUNTS.get("/aflaky", 0) >= 3, timeout=10)
+        check("async: nats delivered", len(got["async"]) == 1 and json.loads(got["async"][0][0]) == {"event": "opened"}, got["async"])
+        check("async: http retried 500,500,200 in background (3 hits)", COUNTS.get("/aflaky") == 3, COUNTS.get("/aflaky"))
+        keys = [k for p, k in SEEN if p == "/aflaky"]
+        check("async: SAME Idempotency-Key across background retries", keys == ["async-1"] * 3, keys)
+        check("async: Nats-Msg-Id == key", got["async"] and got["async"][0][1].get("Nats-Msg-Id") == "async-1", got["async"])
+        _c = pika.BlockingConnection(pika.ConnectionParameters("127.0.0.1")); _ch = _c.channel()
+        meth, props, body = _ch.basic_get("hermes.async.q", auto_ack=True); _c.close()
+        check("async: rabbitmq delivered with message_id", meth is not None and props.message_id == "async-1", props)
+
+        await wait_for(lambda: "pending    0" in admin("stats")[1] and "in_flight  0" in admin("stats")[1], timeout=5)
+        rc, out = admin("stats")
+        check("admin outbox stats: 3 delivered, 0 pending, 0 dead", rc == 0 and "delivered  3" in out and "pending    0" in out and "dead       0" in out, out)
+
+        # sender redelivery with the same key is recognised, nothing delivered twice
+        s, r = post("/webhook/async-fan", {"action": "opened"}, {"Idempotency-Key": "async-1"})
+        check("async: repeated sender key => 202 duplicate, 0 queued", s == 202 and r["duplicate"] is True and r["queued"] == 0, (s, r))
+        await asyncio.sleep(1.0)
+        check("async: duplicate was NOT delivered again", COUNTS.get("/aflaky") == 3 and len(got["async"]) == 1, (COUNTS.get("/aflaky"), len(got["async"])))
+
+        # a template that renders invalid JSON is refused up front
+        s, r = post("/webhook/async-badtpl", {"x": 1})
+        check("async: bad template => 500 and nothing queued", s == 500 and "not valid JSON" in r["error"] and "delivered  3" in admin("stats")[1] and "pending    0" in admin("stats")[1], (s, r))
+
+        # ---- dead letter + replay ----
+        s, r = post("/webhook/async-dlq", {}, {"Idempotency-Key": "dlq-1"})
+        check("dlq: accepted", s == 202, (s, r))
+        ok = await wait_for(lambda: "dead       1" in admin("stats")[1], timeout=8)
+        rc, out = admin("list", "--state", "dead")
+        check("dlq: retries exhausted => dead letter with reason", ok and "dlq" in out and "HTTP 500" in out and " 2 " in out, out)
+        check("dlq: target got exactly 2 attempts", COUNTS.get("/dlq") == 2, COUNTS.get("/dlq"))
+        rc, out = admin("replay")
+        check("admin replay: refuses without --id/--endpoint/--all", rc != 0, out)
+        HEALTHY["dlq"] = True                                  # the outage is over…
+        rc, out = admin("replay", "--endpoint", "/webhook/async-dlq")
+        check("admin replay --endpoint re-queues 1 job", rc == 0 and "Re-queued 1" in out, out)
+        ok = await wait_for(lambda: "dead       0" in admin("stats")[1] and COUNTS.get("/dlq") == 3, timeout=8)
+        keys = [k for p, k in SEEN if p == "/dlq"]
+        check("dlq: replayed job delivered, same idempotency key", ok and keys == ["dlq-1"] * 3, (COUNTS.get("/dlq"), keys))
+
+        # ---- crash safety 1: queued jobs survive kill -9 ----
+        for i in (1, 2, 3):
+            s, r = post("/webhook/async-crash", {}, {"Idempotency-Key": f"crash-{i}"})
+            assert s == 202, (s, r)
+        kill_hermes()
+        check("crash: jobs are on disk after kill -9 (outbox file present)", os.path.getsize(OUTBOX) > 0)
+        crash_srv = serve(3997)                                 # destination becomes reachable
+        start_hermes()                                          # restart: workers resume from disk
+        ok = await wait_for(lambda: {k for p, k in SEEN if p == "/crash"} == {"crash-1", "crash-2", "crash-3"}, timeout=15)
+        check("crash: all 3 accepted webhooks delivered after restart (none lost)", ok, [k for p, k in SEEN if p == "/crash"])
+        await wait_for(lambda: "pending    0" in admin("stats")[1], timeout=5)
+        check("crash: queue drained", "pending    0" in admin("stats")[1] and "in_flight  0" in admin("stats")[1], admin("stats")[1])
+
+        # ---- crash safety 2: kill while a delivery is IN FLIGHT ----
+        s, r = post("/webhook/async-slow", {}, {"Idempotency-Key": "slow-1"})
+        check("slow: 202 immediately although target takes 1.5s", s == 202, (s, r))
+        ok = await wait_for(lambda: COUNTS.get("/slow", 0) >= 1, timeout=5)   # request reached the target…
+        kill_hermes()                                                          # …and Hermes dies mid-request
+        in_flight = admin("stats")[1]
+        check("slow: job is stuck in_flight at crash time", ok and "in_flight  1" in in_flight, in_flight)
+        start_hermes()
+        ok = await wait_for(lambda: COUNTS.get("/slow", 0) >= 2 and "delivered" in admin("stats")[1] and "in_flight  0" in admin("stats")[1], timeout=12)
+        keys = [k for p, k in SEEN if p == "/slow"]
+        check("slow: orphaned in-flight job redelivered after restart (at-least-once)", ok and len(keys) >= 2, (COUNTS.get("/slow"), keys))
+        check("slow: redelivery carries the SAME key so the consumer can dedupe", set(keys) == {"slow-1"}, keys)
+        crash_srv.shutdown()
+
         # 7. resilience: kill RabbitMQ connection from broker side, next publish must reconnect
         for c in json.loads(subprocess.check_output(["rabbitmqctl","list_connections","--formatter","json","name","user"])):
             if "pika" not in c["name"]: pass
@@ -193,7 +310,7 @@ async def main():
         check("rabbit: recovers after broker closes connections", ok, (s, r))
         await nc.close()
     finally:
-        srv.terminate(); srv.wait(timeout=10)
+        HERMES['p'].terminate(); HERMES['p'].wait(timeout=15)
     print(f"\n{sum(results)}/{len(results)} checks passed")
     sys.exit(0 if all(results) else 1)
 asyncio.run(main())

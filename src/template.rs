@@ -49,6 +49,19 @@ pub fn new_handlebars() -> Handlebars<'static> {
     hbs
 }
 
+/// Renders a registered template and parses the result as JSON.
+pub fn render_template(
+    handlebars: &Handlebars,
+    template_name: &str,
+    data: &Map<String, Value>,
+) -> Result<Value, String> {
+    let rendered = handlebars
+        .render(template_name, data)
+        .map_err(|e| format!("Template rendering failed: {e}"))?;
+
+    serde_json::from_str(&rendered).map_err(|e| format!("Rendered template is not valid JSON: {e}"))
+}
+
 /// Wraps non-object JSON bodies as `{"data": <value>}` so templates always
 /// have a map to render against.
 pub fn json_to_template_data(value: &Value) -> Map<String, Value> {

@@ -1,4 +1,8 @@
 # Old scenarios: no retries. New retry/breaker scenarios set their own policy.
+outbox:                      # path comes from HERMES_OUTBOX_PATH (set by run.py)
+  workers: 2
+  poll_interval_ms: 100
+  lease_secs: 60
 settings:
   retry_attempts: 1
   circuit_breaker: { failure_threshold: 4, cooldown_secs: 3 }
@@ -110,3 +114,46 @@ registers:
     template: '{"n": 1}'
     retry_config: { attempts: 1 }
     target: { url: "http://127.0.0.1:3998/ping" }
+
+  # ================= async mode (durable outbox) =================
+  # http fails twice then succeeds, plus nats + rabbitmq; one shared idempotency key
+  - endpoint: /webhook/async-fan
+    method: POST
+    mode: async
+    template: '{"event": "{{ action }}"}'
+    retry_config: { attempts: 5, delay_ms: 200, backoff_multiplier: 1.0, jitter: false }
+    targets:
+      - { name: aflaky, url: "http://127.0.0.1:3999/aflaky" }
+      - { name: nats-a, type: nats, url: "nats://127.0.0.1:4222", subject: hooks.async }
+      - { name: rmq-a, type: rabbitmq, url: "amqp://guest:guest@127.0.0.1:5672/%2f", routing_key: hermes.async.q, queue: hermes.async.q }
+
+  # always 500 until the test flips a switch => dead letter => replay
+  - endpoint: /webhook/async-dlq
+    method: POST
+    mode: async
+    template: '{"n": 1}'
+    retry_config: { attempts: 2, delay_ms: 100, jitter: false }
+    target: { name: dlq, url: "http://127.0.0.1:3999/dlq" }
+
+  # destination is down while messages arrive; Hermes is killed and restarted
+  - endpoint: /webhook/async-crash
+    method: POST
+    mode: async
+    template: '{"n": 1}'
+    retry_config: { attempts: 50, delay_ms: 300, backoff_multiplier: 1.0, max_delay_ms: 300, jitter: false, max_elapsed_ms: null }
+    target: { name: crash, url: "http://127.0.0.1:3997/crash" }
+
+  # slow destination: Hermes is killed while the request is in flight
+  - endpoint: /webhook/async-slow
+    method: POST
+    mode: async
+    template: '{"n": 1}'
+    retry_config: { attempts: 5, delay_ms: 200, jitter: false }
+    target: { name: slow, url: "http://127.0.0.1:3999/slow" }
+
+  # template renders invalid JSON: must be rejected up front, nothing queued
+  - endpoint: /webhook/async-badtpl
+    method: POST
+    mode: async
+    template: '{"a": {{ nothing_here }} }'
+    target: { url: "http://127.0.0.1:3999/never" }

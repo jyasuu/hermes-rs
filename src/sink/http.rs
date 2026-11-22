@@ -32,6 +32,9 @@ impl HttpSink {
         }
 
         let response = builder.send().await.map_err(|e| {
+            // `without_url`: reqwest errors embed the full URL, which may carry
+            // credentials or tokens; the target's label already identifies it.
+            let e = e.without_url();
             let msg = format!("Failed to send request to target: {e}");
             // Connect errors, resets and timeouts are transient; a request we
             // couldn't even build or a redirect loop will never succeed.

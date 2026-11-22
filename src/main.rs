@@ -1,26 +1,30 @@
 use axum::{
     extract::{Path, State},
-    http::{HeaderMap, StatusCode},
-    response::Json,
+    http::{header, HeaderMap, StatusCode},
+    response::{IntoResponse, Json, Response},
     routing::{any, get},
     Router,
 };
 use clap::Parser;
-use handlebars::Handlebars;
 use hermes_rs::{
-    config::{Args, Config, DeliveryPolicy, Target},
+    config::{Args, Config, DispatchMode},
     health,
     idempotency::resolve_message_id,
-    sink::{BroadcastReport, Delivery, Dispatcher, RetryPolicy},
-    template::{json_to_template_data, new_handlebars},
+    outbox::{
+        worker::{self, WorkerContext},
+        Enqueued, NewJob, Outbox,
+    },
+    registry::{CompiledRegister, Registry},
+    sink::{BroadcastReport, Delivery, Dispatcher},
+    template::{json_to_template_data, render_template},
 };
 use serde::Serialize;
 use serde_json::Value;
-use std::{collections::HashMap, sync::Arc};
-use tokio::net::TcpListener;
+use std::{sync::Arc, time::Duration};
+use tokio::{net::TcpListener, sync::watch};
 use tower::ServiceBuilder;
 use tower_http::trace::TraceLayer;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
 // ---------------------------------------------------------------------------
@@ -57,95 +61,17 @@ type ApiResult<T> = Result<T, ApiError>;
 // Application state
 // ---------------------------------------------------------------------------
 
-/// A target plus the name of the template compiled for it.
-struct CompiledTarget {
-    label: String,
-    target: Target,
-    /// `Some` when the target overrides the register's template.
-    own_template: Option<String>,
-    /// Effective retry policy: target > register `retry_config` > `settings`.
-    retry: RetryPolicy,
-}
-
-struct CompiledRegister {
-    delivery: DeliveryPolicy,
-    default_template: String,
-    targets: Vec<CompiledTarget>,
-}
-
 struct Inner {
-    registers: HashMap<String, CompiledRegister>,
-    handlebars: Handlebars<'static>,
-    dispatcher: Dispatcher,
+    registry: Arc<Registry>,
+    dispatcher: Arc<Dispatcher>,
+    /// Present when at least one register uses `mode: async`.
+    outbox: Option<Outbox>,
+    max_pending: u64,
 }
 
 /// Cheap to clone: axum clones state for every request.
 #[derive(Clone)]
 struct AppState(Arc<Inner>);
-
-impl AppState {
-    /// Compiles every template up front. `Config::validate` must have run.
-    fn new(config: &Config, args: &Args) -> Self {
-        let mut hbs = new_handlebars();
-        let mut registers = HashMap::new();
-        let global_policy = RetryPolicy::from_settings(&config.settings);
-
-        for (i, reg) in config.registers.iter().enumerate() {
-            let register_policy = reg
-                .retry_config
-                .as_ref()
-                .map(RetryPolicy::from_config)
-                .unwrap_or(global_policy);
-
-            let default_template = format!("reg{i}");
-            hbs.register_template_string(&default_template, &reg.template)
-                .unwrap_or_else(|e| panic!("Failed to register template '{default_template}': {e}"));
-
-            let targets = reg
-                .all_targets()
-                .enumerate()
-                .map(|(j, t)| {
-                    let own_template = t.template.as_ref().map(|tpl| {
-                        let name = format!("reg{i}_t{j}");
-                        hbs.register_template_string(&name, tpl)
-                            .unwrap_or_else(|e| panic!("Failed to register template '{name}': {e}"));
-                        name
-                    });
-                    let retry = t.retry.as_ref().map(RetryPolicy::from_config).unwrap_or(register_policy);
-                    CompiledTarget { label: t.label(j), target: t.clone(), own_template, retry }
-                })
-                .collect();
-
-            registers.insert(
-                reg.endpoint.clone(),
-                CompiledRegister { delivery: reg.delivery, default_template, targets },
-            );
-        }
-
-        AppState(Arc::new(Inner {
-            registers,
-            handlebars: hbs,
-            dispatcher: Dispatcher::new(args.request_timeout, &config.settings),
-        }))
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Template rendering  (Single Responsibility)
-// ---------------------------------------------------------------------------
-
-fn render_template(
-    handlebars: &Handlebars,
-    template_name: &str,
-    data: &serde_json::Map<String, Value>,
-) -> Result<Value, String> {
-    let rendered = handlebars
-        .render(template_name, data)
-        .map_err(|e| format!("Template rendering failed: {e}"))?;
-
-    serde_json::from_str(&rendered)
-        .map_err(|e| format!("Rendered template is not valid JSON: {e}"))
-}
 
 // ---------------------------------------------------------------------------
 // Handlers
@@ -156,14 +82,14 @@ async fn handle_webhook(
     Path(path): Path<String>,
     headers: HeaderMap,
     body: String,
-) -> ApiResult<(StatusCode, Json<Value>)> {
+) -> ApiResult<Response> {
     let endpoint = format!("/{}", path);
     // One id for this request: shared by every target and every retry.
     let message_id = resolve_message_id(&headers);
 
     info!(endpoint = %endpoint, message_id = %message_id, payload_size = body.len(), "Processing webhook request");
 
-    let register = state.0.registers.get(&endpoint).ok_or_else(|| {
+    let register = state.0.registry.registers.get(&endpoint).ok_or_else(|| {
         warn!(endpoint = %endpoint, "Webhook endpoint not found");
         ErrorResponse::not_found("Endpoint not found")
     })?;
@@ -171,32 +97,53 @@ async fn handle_webhook(
     let request_data: Value = serde_json::from_str(&body)
         .map_err(|e| ErrorResponse::bad_request(format!("Invalid JSON: {}", e)))?;
     let template_data = json_to_template_data(&request_data);
+    let hbs = &state.0.registry.handlebars;
 
     // Render the register-level template once and share it between all
     // targets that don't bring their own.
-    let default_payload = render_template(&state.0.handlebars, &register.default_template, &template_data);
+    let default_payload = render_template(hbs, &register.default_template, &template_data);
     if let Err(e) = &default_payload {
         if register.targets.iter().all(|t| t.own_template.is_none()) {
             return Err(ErrorResponse::internal(e.clone()));
         }
     }
+    let payloads: Vec<Result<Value, String>> = register
+        .targets
+        .iter()
+        .map(|t| match &t.own_template {
+            Some(name) => render_template(hbs, name, &template_data),
+            None => default_payload.clone(),
+        })
+        .collect();
 
+    match register.mode {
+        DispatchMode::Sync => deliver_sync(&state, &endpoint, register, &message_id, payloads).await,
+        DispatchMode::Async => accept_async(&state, &endpoint, register, &message_id, payloads).await,
+    }
+}
+
+/// `mode: sync` — deliver now, report what happened to every target.
+async fn deliver_sync(
+    state: &AppState,
+    endpoint: &str,
+    register: &CompiledRegister,
+    message_id: &str,
+    payloads: Vec<Result<Value, String>>,
+) -> ApiResult<Response> {
     let deliveries: Vec<Delivery> = register
         .targets
         .iter()
-        .map(|t| Delivery {
+        .zip(payloads)
+        .map(|(t, payload)| Delivery {
             label: t.label.clone(),
             target: &t.target,
-            payload: match &t.own_template {
-                Some(name) => render_template(&state.0.handlebars, name, &template_data),
-                None => default_payload.clone(),
-            },
+            payload,
             retry: t.retry,
         })
         .collect();
 
     let total = deliveries.len();
-    let outcomes = state.0.dispatcher.broadcast(&message_id, deliveries).await;
+    let outcomes = state.0.dispatcher.broadcast(message_id, deliveries).await;
     let report = BroadcastReport::new(register.delivery, outcomes);
 
     for r in &report.results {
@@ -238,10 +185,78 @@ async fn handle_webhook(
                 .collect::<Vec<_>>()
                 .join("; "),
         );
-        return Ok((StatusCode::BAD_GATEWAY, Json(resp)));
+        return Ok((StatusCode::BAD_GATEWAY, Json(resp)).into_response());
     }
 
-    Ok((StatusCode::OK, Json(resp)))
+    Ok((StatusCode::OK, Json(resp)).into_response())
+}
+
+/// `mode: async` — persist one job per target, answer 202, deliver later.
+/// The reply is only sent after the jobs are safely on disk.
+async fn accept_async(
+    state: &AppState,
+    endpoint: &str,
+    register: &CompiledRegister,
+    message_id: &str,
+    payloads: Vec<Result<Value, String>>,
+) -> ApiResult<Response> {
+    let outbox = state
+        .0
+        .outbox
+        .as_ref()
+        .ok_or_else(|| ErrorResponse::internal("Async mode is enabled but the outbox is not available"))?;
+
+    // All-or-nothing: never accept a message we already know we can't deliver.
+    let mut jobs = Vec::with_capacity(payloads.len());
+    for (j, (t, payload)) in register.targets.iter().zip(payloads).enumerate() {
+        let payload = payload.map_err(|e| ErrorResponse::internal(format!("target '{}': {e}", t.label)))?;
+        jobs.push(NewJob { target_index: j, target_label: t.label.clone(), payload: payload.to_string() });
+    }
+
+    match outbox
+        .enqueue(message_id.to_string(), endpoint.to_string(), jobs, state.0.max_pending)
+        .await
+    {
+        Ok(Enqueued::Accepted(n)) => {
+            info!(endpoint = %endpoint, message_id = %message_id, jobs = n, "Webhook accepted (async)");
+            Ok((
+                StatusCode::ACCEPTED,
+                Json(serde_json::json!({
+                    "status": "accepted",
+                    "message_id": message_id,
+                    "queued": n,
+                    "duplicate": false,
+                })),
+            )
+                .into_response())
+        }
+        Ok(Enqueued::Duplicate) => {
+            info!(endpoint = %endpoint, message_id = %message_id, "Duplicate webhook ignored (already accepted)");
+            Ok((
+                StatusCode::ACCEPTED,
+                Json(serde_json::json!({
+                    "status": "accepted",
+                    "message_id": message_id,
+                    "queued": 0,
+                    "duplicate": true,
+                })),
+            )
+                .into_response())
+        }
+        Ok(Enqueued::Full) => {
+            warn!(endpoint = %endpoint, max_pending = state.0.max_pending, "Outbox full, shedding load");
+            Ok((
+                StatusCode::SERVICE_UNAVAILABLE,
+                [(header::RETRY_AFTER, "5")],
+                Json(ErrorResponse::new("Outbox is full, retry later")),
+            )
+                .into_response())
+        }
+        Err(e) => {
+            error!(endpoint = %endpoint, error = %e, "Could not persist webhook");
+            Err(ErrorResponse::internal("Could not persist webhook"))
+        }
+    }
 }
 
 async fn handle_debug_request(
@@ -333,6 +348,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             info!(
                 method = %register.method,
                 endpoint = %register.endpoint,
+                mode = ?register.mode,
                 target = %target.label(j),
                 kind = target.type_name(),
                 destination = %target.describe(),
@@ -342,7 +358,45 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    let state = AppState::new(&config, &args);
+    let registry = Arc::new(Registry::build(&config));
+    let dispatcher = Arc::new(Dispatcher::new(args.request_timeout, &config.settings));
+
+    // Async mode needs the durable outbox and its delivery workers.
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let mut worker_handles = Vec::new();
+    let outbox = if config.has_async_registers() {
+        if args.request_timeout >= config.outbox.lease_secs {
+            return Err(format!(
+                "HERMES_REQUEST_TIMEOUT ({}s) must be below outbox.lease_secs ({}s), otherwise a slow \
+                 delivery could be handed to a second worker",
+                args.request_timeout, config.outbox.lease_secs
+            )
+            .into());
+        }
+        let path = config.outbox_path();
+        info!(path = %path.display(), workers = config.outbox.workers, "Opening outbox");
+        let outbox = Outbox::open(&path)?;
+        worker_handles = worker::spawn(
+            WorkerContext {
+                outbox: outbox.clone(),
+                registry: registry.clone(),
+                dispatcher: dispatcher.clone(),
+                settings: config.outbox.clone(),
+            },
+            shutdown_rx,
+        )
+        .await;
+        Some(outbox)
+    } else {
+        None
+    };
+
+    let state = AppState(Arc::new(Inner {
+        registry,
+        dispatcher,
+        outbox,
+        max_pending: config.outbox.max_pending,
+    }));
     let app = build_router(state, &args);
 
     let addr = format!("{}:{}", args.bind_address, args.port);
@@ -354,6 +408,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await?;
+
+    // Stop the outbox workers: each finishes the delivery in hand, and
+    // anything unfinished is recovered on the next start.
+    let _ = shutdown_tx.send(true);
+    if !worker_handles.is_empty() {
+        info!("Waiting for outbox workers to finish");
+        let all = futures_util::future::join_all(worker_handles);
+        if tokio::time::timeout(Duration::from_secs(30), all).await.is_err() {
+            warn!("Outbox workers did not stop within 30s; unfinished jobs will be retried on next start");
+        }
+    }
 
     info!("Server shutdown complete");
     Ok(())

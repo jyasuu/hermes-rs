@@ -44,6 +44,9 @@ pub struct Config {
     pub registers: Vec<WebhookRegister>,
     #[serde(default)]
     pub settings: AppSettings,
+    /// Durable queue used by registers with `mode: async`.
+    #[serde(default)]
+    pub outbox: OutboxSettings,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -94,6 +97,104 @@ impl Default for CircuitBreakerSettings {
     }
 }
 
+/// Durable queue (SQLite) behind `mode: async` registers.
+///
+/// The file holds rendered payloads in clear text: protect it like the
+/// webhooks themselves (Hermes creates it with mode 0600 on Unix).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct OutboxSettings {
+    /// Database file. The `HERMES_OUTBOX_PATH` env var overrides this.
+    #[serde(default = "default_outbox_path")]
+    pub path: PathBuf,
+    /// Concurrent delivery workers.
+    #[serde(default = "default_outbox_workers")]
+    pub workers: usize,
+    /// How long a worker may hold a job before it is presumed crashed and
+    /// the job is handed to another worker. Must exceed every target timeout.
+    #[serde(default = "default_outbox_lease")]
+    pub lease_secs: u64,
+    /// How often idle workers look for due jobs.
+    #[serde(default = "default_outbox_poll")]
+    pub poll_interval_ms: u64,
+    /// Reject new async webhooks with 503 once this many jobs are waiting,
+    /// so an outage cannot fill the disk.
+    #[serde(default = "default_outbox_max_pending")]
+    pub max_pending: u64,
+    /// Delivered jobs are kept this long (this is also the window in which a
+    /// repeated sender `Idempotency-Key` is recognised as a duplicate).
+    #[serde(default = "default_outbox_delivered_retention")]
+    pub delivered_retention_secs: u64,
+    /// Dead-lettered jobs are kept this long unless replayed or purged.
+    #[serde(default = "default_outbox_dead_retention")]
+    pub dead_retention_secs: u64,
+    /// Retry policy for async deliveries (nobody is waiting, so it is far more
+    /// patient than the sync default). Per-target `retry` and register
+    /// `retry_config` still take precedence.
+    #[serde(default)]
+    pub retry: OutboxRetry,
+}
+
+/// Same knobs as [`RetryConfig`] but with defaults suited to background
+/// delivery. A separate type so that overriding one field (say `attempts`)
+/// keeps the *outbox* defaults for the rest instead of the sync ones.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct OutboxRetry {
+    #[serde(default = "ob_attempts")]
+    pub attempts: u32,
+    #[serde(default = "ob_delay_ms")]
+    pub delay_ms: u64,
+    #[serde(default = "default_backoff")]
+    pub backoff_multiplier: f64,
+    #[serde(default = "ob_max_delay_ms")]
+    pub max_delay_ms: u64,
+    /// `null` (default) = keep retrying until `attempts` is used up.
+    #[serde(default)]
+    pub max_elapsed_ms: Option<u64>,
+    #[serde(default = "default_true")]
+    pub jitter: bool,
+}
+
+impl Default for OutboxRetry {
+    fn default() -> Self {
+        Self {
+            attempts: ob_attempts(),
+            delay_ms: ob_delay_ms(),
+            backoff_multiplier: default_backoff(),
+            max_delay_ms: ob_max_delay_ms(),
+            max_elapsed_ms: None,
+            jitter: true,
+        }
+    }
+}
+
+impl OutboxRetry {
+    pub fn to_config(&self) -> RetryConfig {
+        RetryConfig {
+            attempts: self.attempts,
+            delay_ms: self.delay_ms,
+            backoff_multiplier: self.backoff_multiplier,
+            max_delay_ms: self.max_delay_ms,
+            max_elapsed_ms: self.max_elapsed_ms,
+            jitter: self.jitter,
+        }
+    }
+}
+
+impl Default for OutboxSettings {
+    fn default() -> Self {
+        Self {
+            path: default_outbox_path(),
+            workers: default_outbox_workers(),
+            lease_secs: default_outbox_lease(),
+            poll_interval_ms: default_outbox_poll(),
+            max_pending: default_outbox_max_pending(),
+            delivered_retention_secs: default_outbox_delivered_retention(),
+            dead_retention_secs: default_outbox_dead_retention(),
+            retry: OutboxRetry::default(),
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Register
 // ---------------------------------------------------------------------------
@@ -111,7 +212,11 @@ pub struct WebhookRegister {
     pub targets: Vec<Target>,
     /// Default template; individual targets may override it.
     pub template: String,
-    /// When does the inbound request count as successfully delivered?
+    /// `sync` (default): deliver while the caller waits and report the result.
+    /// `async`: save to the durable outbox, answer `202`, deliver in the background.
+    #[serde(default)]
+    pub mode: DispatchMode,
+    /// `sync` mode only: when does the request count as successfully delivered?
     #[serde(default)]
     pub delivery: DeliveryPolicy,
     #[serde(default)]
@@ -123,6 +228,14 @@ impl WebhookRegister {
     pub fn all_targets(&self) -> impl Iterator<Item = &Target> {
         self.target.iter().chain(self.targets.iter())
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DispatchMode {
+    #[default]
+    Sync,
+    Async,
 }
 
 /// Success criterion for a broadcast.
@@ -376,6 +489,36 @@ fn default_cb_threshold() -> u32 {
 fn default_cb_cooldown() -> u64 {
     30
 }
+fn default_outbox_path() -> PathBuf {
+    PathBuf::from("hermes-outbox.db")
+}
+fn default_outbox_workers() -> usize {
+    4
+}
+fn default_outbox_lease() -> u64 {
+    300
+}
+fn default_outbox_poll() -> u64 {
+    500
+}
+fn default_outbox_max_pending() -> u64 {
+    100_000
+}
+fn default_outbox_delivered_retention() -> u64 {
+    24 * 3600
+}
+fn default_outbox_dead_retention() -> u64 {
+    7 * 24 * 3600
+}
+fn ob_attempts() -> u32 {
+    8
+}
+fn ob_delay_ms() -> u64 {
+    1_000
+}
+fn ob_max_delay_ms() -> u64 {
+    300_000
+}
 fn default_http_method() -> String {
     "POST".to_string()
 }
@@ -394,6 +537,18 @@ impl Config {
         Ok(config)
     }
 
+    /// Outbox database path; `HERMES_OUTBOX_PATH` wins over the file.
+    pub fn outbox_path(&self) -> PathBuf {
+        std::env::var_os("HERMES_OUTBOX_PATH")
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| self.outbox.path.clone())
+    }
+
+    pub fn has_async_registers(&self) -> bool {
+        self.registers.iter().any(|r| r.mode == DispatchMode::Async)
+    }
+
     /// Semantic checks beyond what serde enforces. Used at server startup and
     /// by `hermes-admin validate-config`.
     pub fn validate(&self) -> Result<(), String> {
@@ -406,6 +561,10 @@ impl Config {
         let cb = &self.settings.circuit_breaker;
         if cb.enabled && (cb.failure_threshold == 0 || cb.cooldown_secs == 0) {
             return Err("settings.circuit_breaker: failure_threshold and cooldown_secs must be >= 1".into());
+        }
+        let ob = &self.outbox;
+        if ob.workers == 0 || ob.lease_secs == 0 || ob.poll_interval_ms == 0 || ob.max_pending == 0 {
+            return Err("outbox: workers, lease_secs, poll_interval_ms and max_pending must be >= 1".into());
         }
         let check_retry = |at: &str, r: &RetryConfig| -> Result<(), String> {
             if r.attempts == 0 {
@@ -445,6 +604,9 @@ impl Config {
             if let Some(r) = &reg.retry_config {
                 check_retry(&at, r)?;
             }
+            if reg.mode == DispatchMode::Async {
+                check_retry(&format!("{at} (outbox.retry)"), &ob.retry.to_config())?;
+            }
 
             for (j, t) in targets.iter().enumerate() {
                 let tl = format!("{at}, target '{}'", t.label(j));
@@ -458,6 +620,13 @@ impl Config {
                     TargetKind::Http(h) => {
                         if h.url.is_empty() {
                             return Err(format!("{tl}: target URL cannot be empty"));
+                        }
+                        if reg.mode == DispatchMode::Async && h.timeout_seconds.unwrap_or(0) >= ob.lease_secs {
+                            return Err(format!(
+                                "{tl}: timeout_seconds must be below outbox.lease_secs ({}), otherwise a slow \
+                                 delivery could be handed to a second worker",
+                                ob.lease_secs
+                            ));
                         }
                         if !valid_methods.contains(&h.method.to_uppercase().as_str()) {
                             return Err(format!("{tl}: invalid HTTP method '{}'", h.method));
@@ -660,5 +829,37 @@ registers:
         assert!(mult.validate().unwrap_err().contains("backoff_multiplier"));
         let cb = parse("settings: { circuit_breaker: { failure_threshold: 0 } }\nregisters:\n  - { endpoint: /w, method: POST, template: '{}', target: { url: 'http://a' } }\n");
         assert!(cb.validate().unwrap_err().contains("circuit_breaker"));
+    }
+
+    #[test]
+    fn async_mode_and_outbox_defaults() {
+        let cfg = parse(
+            r#"
+outbox: { path: /data/o.db, workers: 2 }
+registers:
+  - { endpoint: /a, method: POST, mode: async, template: '{}', target: { url: "http://x" } }
+  - { endpoint: /b, method: POST, template: '{}', target: { url: "http://x" } }
+"#,
+        );
+        cfg.validate().unwrap();
+        assert_eq!(cfg.registers[0].mode, DispatchMode::Async);
+        assert_eq!(cfg.registers[1].mode, DispatchMode::Sync);
+        assert!(cfg.has_async_registers());
+        assert_eq!((cfg.outbox.workers, cfg.outbox.lease_secs, cfg.outbox.max_pending), (2, 300, 100_000));
+        assert_eq!(cfg.outbox.retry.attempts, 8);
+        assert_eq!(cfg.outbox.retry.max_elapsed_ms, None);
+        assert!(!parse("registers: []\n").has_async_registers());
+    }
+
+    #[test]
+    fn validate_rejects_target_timeout_beyond_lease_in_async() {
+        let cfg = parse(
+            "outbox: { lease_secs: 10 }\nregisters:\n  - { endpoint: /a, method: POST, mode: async, template: '{}', target: { url: 'http://x', timeout_seconds: 10 } }\n",
+        );
+        assert!(cfg.validate().unwrap_err().contains("lease_secs"));
+        let sync_ok = parse(
+            "outbox: { lease_secs: 10 }\nregisters:\n  - { endpoint: /a, method: POST, template: '{}', target: { url: 'http://x', timeout_seconds: 99 } }\n",
+        );
+        sync_ok.validate().unwrap();
     }
 }

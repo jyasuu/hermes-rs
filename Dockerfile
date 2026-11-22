@@ -33,6 +33,12 @@ WORKDIR /app
 
 # Copy the compiled binary from the build stage
 COPY --from=builder /usr/src/app/target/release/hermes-rs .
+# Operator tool: `docker exec <ctr> ./hermes-admin outbox stats`
+COPY --from=builder /usr/src/app/target/release/hermes-admin .
+
+# Durable outbox for `mode: async` registers. Mount a volume here.
+ENV HERMES_OUTBOX_PATH=/data/outbox.db
+VOLUME /data
 
 EXPOSE 3000
 

@@ -2,6 +2,8 @@ pub mod admin;
 pub mod config;
 pub mod health;
 pub mod idempotency;
+pub mod outbox;
+pub mod registry;
 pub mod sink;
 pub mod template;
 

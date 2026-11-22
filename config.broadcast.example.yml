@@ -1,3 +1,12 @@
+# Durable queue behind `mode: async` registers (all optional)
+outbox:
+  path: /data/outbox.db         # HERMES_OUTBOX_PATH overrides; keep it on a persistent volume
+  workers: 4
+  max_pending: 100000           # beyond this, new async webhooks get 503 + Retry-After
+  retry:                        # patient defaults: nobody is waiting on a background retry
+    attempts: 8                 # 1s, 2s, 4s … capped at max_delay_ms
+    max_delay_ms: 300000
+
 # Global defaults (all optional)
 settings:
   retry_attempts: 3            # total tries per target, 1 = never retry
@@ -55,3 +64,13 @@ registers:
         jetstream: true
         template: |                    # per-target template override
           {"kind": "github", "action": "{{ action }}"}
+
+  # Async: answer 202 as soon as the job is safely on disk, deliver in the background.
+  # Survives crashes and restarts; failures end up as replayable dead letters.
+  - endpoint: /webhook/stripe
+    method: POST
+    mode: async
+    template: '{"type": "{{ type }}"}'
+    targets:
+      - { name: billing, url: "http://billing.internal/events" }
+      - { name: bus, type: nats, url: "nats://nats:4222", subject: js.stripe, jetstream: true }

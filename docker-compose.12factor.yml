@@ -15,12 +15,15 @@ services:
       - HERMES_LOG_FORMAT=${HERMES_LOG_FORMAT:-json}
       - HERMES_REQUEST_TIMEOUT=${HERMES_REQUEST_TIMEOUT:-30}
       - HERMES_HEALTH_CHECK_ENABLED=true
+      # Durable queue for `mode: async` (must live on a persistent volume)
+      - HERMES_OUTBOX_PATH=/data/outbox.db
       # IV. Backing services - Treat backing services as attached resources
       - DATABASE_URL=${DATABASE_URL:-}
       - REDIS_URL=${REDIS_URL:-}
     volumes:
       # Mount config as volume for easy updates
       - ./config.yml:/app/config.yml:ro
+      - hermes_outbox:/data
       # XI. Logs - Treat logs as event streams
       - /dev/stdout:/dev/stdout
       - /dev/stderr:/dev/stderr
@@ -58,5 +61,6 @@ services:
     restart: unless-stopped
 
 volumes:
+  hermes_outbox:
   redis_data:
   prometheus_data:

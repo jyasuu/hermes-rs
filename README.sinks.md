@@ -95,6 +95,64 @@ then a single probe decides whether to close it. Only *unhealthy* outcomes
 count: a 4xx or an unroutable message proves the destination is alive.
 State is per process and in memory.
 
+## Async mode: durable outbox & dead letters
+
+```yaml
+registers:
+  - endpoint: /webhook/stripe
+    method: POST
+    mode: async              # default: sync
+    template: '{"type": "{{ type }}"}'
+    targets: [ ... ]
+```
+
+In `sync` mode (default) the caller waits for delivery and gets the per-target
+result. In `async` mode Hermes renders the payloads, **writes one job per target
+to a SQLite outbox and fsyncs it, then answers `202`** —
+`{"status":"accepted","message_id":…,"queued":N,"duplicate":false}`. Background
+workers deliver, so a slow or dead destination never slows the sender down.
+
+| situation | behaviour |
+|---|---|
+| Hermes crashes / is killed / restarts | queued jobs are on disk and resume; jobs that were mid-delivery are redelivered (same idempotency key) |
+| destination down | retried with backoff (`outbox.retry`, default 8 attempts ≈ 4 min, 5 min cap); while its circuit breaker is open jobs wait **without using up attempts** |
+| permanent error (4xx, unroutable) or attempts exhausted | job becomes a **dead letter** — kept (7 days by default) until replayed or purged |
+| sender repeats a webhook with the same `Idempotency-Key` / `X-GitHub-Delivery` | answered `202` with `"duplicate": true`, **not queued again** (window = `delivered_retention_secs`, 24 h) |
+| too many jobs waiting (`max_pending`) | `503` + `Retry-After: 5`, so an outage can't fill the disk |
+| template renders invalid JSON | `500` up front, nothing queued |
+| a target is removed/reordered in the config while jobs are queued | those jobs are dead-lettered with an explanatory error rather than sent to the wrong place |
+
+Precedence for the retry policy of an async delivery: target `retry` > register
+`retry_config` > `outbox.retry`. `delivery:` (all/any/best_effort) only applies
+to `sync` registers; async targets are independent.
+
+```bash
+hermes-admin outbox stats                              # counts per state, age of oldest job
+hermes-admin outbox list --state dead                  # what failed and why
+hermes-admin outbox replay --endpoint /webhook/stripe  # re-queue after fixing the cause
+hermes-admin outbox replay --id 42                     # …or one job (--all for everything)
+hermes-admin outbox purge  --id 42                     # delete dead letters for good
+```
+`replay`/`purge` require `--id`, `--endpoint` or `--all` and only ever touch
+dead letters. They are safe to run while the server is up. In Docker:
+`docker exec <container> ./hermes-admin outbox stats`.
+
+**Operating notes**
+* Put `HERMES_OUTBOX_PATH` (default `/data/outbox.db` in the images) on a
+  **persistent volume**; the bundled compose file does.
+* **One Hermes instance per outbox file.** It is a local SQLite database, not a
+  shared queue. On start, jobs left "in flight" by a previous process are
+  redelivered immediately.
+* **Delivery is at-least-once and unordered.** Parallel workers and retries mean
+  event B can reach a target before event A. Consumers must tolerate repeats
+  (use the idempotency key) and must not depend on order.
+* The sender only learns "accepted", not the eventual outcome. **Watch for dead
+  letters** (`outbox stats`, `dead N`) — nothing alerts you yet.
+* The file holds rendered payloads **in clear text** (created `0600`); treat it
+  like the webhooks themselves.
+* `HERMES_REQUEST_TIMEOUT` must be below `outbox.lease_secs` (default 300);
+  Hermes refuses to start otherwise.
+
 ## Admin CLI
 
 `hermes-admin validate-config` now also checks target types, URL schemes,
@@ -108,5 +166,8 @@ cargo test                                    # unit tests
 docker compose -f docker-compose.brokers.yml up -d
 cargo build && python3 tests/e2e/run.py       # needs: pip install nats-py pika
 ```
+The e2e suite also `kill -9`s Hermes mid-test to prove the outbox loses nothing,
+and exercises dead letters and replay through the real `hermes-admin` binary.
+It needs a local NATS (with JetStream) and RabbitMQ.
 
 Requires Rust ≥ 1.89 (lapin 4 / async-nats 0.53).

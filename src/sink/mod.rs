@@ -66,6 +66,15 @@ impl BroadcastReport {
     }
 }
 
+/// Result of a single guarded attempt.
+#[derive(Debug)]
+pub enum Attempt {
+    Delivered(Value),
+    Failed(SinkError),
+    /// Not tried: the destination's breaker is open for about `retry_in`.
+    CircuitOpen { retry_in: Duration, error: SinkError },
+}
+
 pub struct Dispatcher {
     http: http::HttpSink,
     rabbit: rabbitmq::RabbitSink,
@@ -116,6 +125,32 @@ impl Dispatcher {
             .unwrap_or_else(|_| Err(SinkError::retryable(format!("timed out after {}s", limit.as_secs()))))
     }
 
+    /// One delivery attempt guarded by the circuit breaker; no retrying.
+    /// This is the building block for both the in-process retry loop
+    /// ([`Dispatcher::deliver`]) and the outbox workers, which schedule
+    /// their retries in the database instead.
+    pub async fn attempt(&self, target: &Target, payload: &Value, message_id: &str) -> Attempt {
+        let key = breaker_key(target);
+        if let Err(wait) = self.breakers.acquire(&key) {
+            let msg = format!(
+                "circuit open for {}: skipped, destination looks down (retry in ~{}s)",
+                target.describe(),
+                wait.as_secs().max(1)
+            );
+            return Attempt::CircuitOpen { retry_in: wait, error: SinkError::permanent(msg) };
+        }
+        match self.send_once(target, payload, message_id).await {
+            Ok(v) => {
+                self.breakers.record(&key, true);
+                Attempt::Delivered(v)
+            }
+            Err(e) => {
+                self.breakers.record(&key, e.destination_healthy());
+                Attempt::Failed(e)
+            }
+        }
+    }
+
     /// Delivers to one target with retries and circuit breaking. Returns the
     /// result and how many attempts were actually made.
     pub async fn deliver(
@@ -125,53 +160,39 @@ impl Dispatcher {
         message_id: &str,
         policy: &RetryPolicy,
     ) -> (Result<Value, SinkError>, u32) {
-        let key = breaker_key(target);
         let started = Instant::now();
         let mut attempts = 0u32;
 
         loop {
-            // Checked before *every* attempt, so a breaker that opens while
-            // we are retrying stops us immediately instead of waiting it out.
-            if let Err(wait) = self.breakers.acquire(&key) {
-                let msg = format!(
-                    "circuit open for {}: skipped, destination looks down (retry in ~{}s)",
-                    target.describe(),
-                    wait.as_secs().max(1)
-                );
-                return (Err(SinkError::permanent(msg)), attempts);
-            }
-
+            // The breaker is consulted before *every* attempt, so one that
+            // opens while we are retrying stops us immediately.
+            let e = match self.attempt(target, payload, message_id).await {
+                Attempt::Delivered(v) => return (Ok(v), attempts + 1),
+                Attempt::CircuitOpen { error, .. } => return (Err(error), attempts),
+                Attempt::Failed(e) => e,
+            };
             attempts += 1;
-            match self.send_once(target, payload, message_id).await {
-                Ok(v) => {
-                    self.breakers.record(&key, true);
-                    return (Ok(v), attempts);
-                }
-                Err(e) => {
-                    self.breakers.record(&key, e.destination_healthy());
-                    if !e.retryable || attempts >= policy.attempts {
-                        return (Err(e), attempts);
-                    }
+            if !e.retryable || attempts >= policy.attempts {
+                return (Err(e), attempts);
+            }
 
-                    let delay = policy.delay_for(attempts, e.retry_after);
-                    if let Some(budget) = policy.max_elapsed {
-                        if started.elapsed() + delay > budget {
-                            let msg = format!("{} (retry time budget of {}ms exhausted)", e.message, budget.as_millis());
-                            return (Err(SinkError { message: msg, ..e }), attempts);
-                        }
-                    }
-
-                    warn!(
-                        target = %target.describe(),
-                        attempt = attempts,
-                        max_attempts = policy.attempts,
-                        retry_in_ms = delay.as_millis() as u64,
-                        error = %e,
-                        "Delivery failed, will retry"
-                    );
-                    tokio::time::sleep(delay).await;
+            let delay = policy.delay_for(attempts, e.retry_after);
+            if let Some(budget) = policy.max_elapsed {
+                if started.elapsed() + delay > budget {
+                    let msg = format!("{} (retry time budget of {}ms exhausted)", e.message, budget.as_millis());
+                    return (Err(SinkError { message: msg, ..e }), attempts);
                 }
             }
+
+            warn!(
+                target = %target.describe(),
+                attempt = attempts,
+                max_attempts = policy.attempts,
+                retry_in_ms = delay.as_millis() as u64,
+                error = %e,
+                "Delivery failed, will retry"
+            );
+            tokio::time::sleep(delay).await;
         }
     }
 
