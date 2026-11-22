@@ -1,15 +1,17 @@
 use axum::{
-    extract::{Path, State},
-    http::{header, HeaderMap, StatusCode},
+    extract::{DefaultBodyLimit, Path, State},
+    http::{header, HeaderMap, Method, StatusCode},
     response::{IntoResponse, Json, Response},
     routing::{any, get},
     Router,
 };
 use clap::Parser;
 use hermes_rs::{
+    auth,
     config::{Args, Config, DispatchMode},
     health,
     idempotency::resolve_message_id,
+    metrics::Metrics,
     outbox::{
         worker::{self, WorkerContext},
         Enqueued, NewJob, Outbox,
@@ -21,7 +23,10 @@ use hermes_rs::{
 use serde::Serialize;
 use serde_json::Value;
 use std::{sync::Arc, time::Duration};
-use tokio::{net::TcpListener, sync::watch};
+use tokio::{
+    net::TcpListener,
+    sync::{watch, Semaphore},
+};
 use tower::ServiceBuilder;
 use tower_http::trace::TraceLayer;
 use tracing::{error, info, warn};
@@ -41,21 +46,12 @@ impl ErrorResponse {
         Self { error: msg.into() }
     }
 
-    fn bad_request(msg: impl Into<String>) -> (StatusCode, Json<Self>) {
-        (StatusCode::BAD_REQUEST, Json(Self::new(msg)))
-    }
-
-    fn not_found(msg: impl Into<String>) -> (StatusCode, Json<Self>) {
-        (StatusCode::NOT_FOUND, Json(Self::new(msg)))
-    }
-
-    fn internal(msg: impl Into<String>) -> (StatusCode, Json<Self>) {
-        (StatusCode::INTERNAL_SERVER_ERROR, Json(Self::new(msg)))
+    fn respond(status: StatusCode, msg: &str) -> Response {
+        (status, Json(Self::new(msg))).into_response()
     }
 }
 
-type ApiError = (StatusCode, Json<ErrorResponse>);
-type ApiResult<T> = Result<T, ApiError>;
+type ApiResult<T> = Result<T, (StatusCode, Json<ErrorResponse>)>;
 
 // ---------------------------------------------------------------------------
 // Application state
@@ -67,6 +63,11 @@ struct Inner {
     /// Present when at least one register uses `mode: async`.
     outbox: Option<Outbox>,
     max_pending: u64,
+    metrics: Arc<Metrics>,
+    /// `Authorization: Bearer` token required by `/metrics`, if configured.
+    metrics_token: Option<String>,
+    /// Bounds in-flight webhook requests (`HERMES_MAX_CONCURRENT_REQUESTS`).
+    limiter: Semaphore,
 }
 
 /// Cheap to clone: axum clones state for every request.
@@ -77,25 +78,78 @@ struct AppState(Arc<Inner>);
 // Handlers
 // ---------------------------------------------------------------------------
 
+/// A finished request plus the label under which it is counted in metrics.
+type Outcome = (Response, &'static str);
+
+fn reject(status: StatusCode, outcome: &'static str, msg: &str) -> Outcome {
+    (ErrorResponse::respond(status, msg), outcome)
+}
+
 async fn handle_webhook(
     State(state): State<AppState>,
+    method: Method,
     Path(path): Path<String>,
     headers: HeaderMap,
     body: String,
-) -> ApiResult<Response> {
+) -> Response {
     let endpoint = format!("/{}", path);
-    // One id for this request: shared by every target and every retry.
-    let message_id = resolve_message_id(&headers);
+    // Only configured endpoints become metric labels, so scanners can't
+    // inflate the number of time series.
+    let label = if state.0.registry.registers.contains_key(&endpoint) { endpoint.as_str() } else { "unknown" };
 
+    let (response, outcome) = match state.0.limiter.try_acquire() {
+        Ok(_permit) => process_webhook(&state, &method, &endpoint, &headers, body).await,
+        Err(_) => {
+            warn!(endpoint = %endpoint, "Too many concurrent requests, shedding load");
+            let (mut r, o) = reject(StatusCode::SERVICE_UNAVAILABLE, "overloaded", "Server is busy, retry later");
+            r.headers_mut().insert(header::RETRY_AFTER, header::HeaderValue::from_static("1"));
+            (r, o)
+        }
+    };
+    state.0.metrics.record_request(label, outcome);
+    response
+}
+
+async fn process_webhook(
+    state: &AppState,
+    method: &Method,
+    endpoint: &str,
+    headers: &HeaderMap,
+    body: String,
+) -> Outcome {
+    let Some(register) = state.0.registry.registers.get(endpoint) else {
+        warn!(endpoint = %endpoint, "Webhook endpoint not found");
+        return reject(StatusCode::NOT_FOUND, "not_found", "Endpoint not found");
+    };
+
+    // The declared method is now enforced (it used to be validated but ignored).
+    if method.as_str() != register.method {
+        warn!(endpoint = %endpoint, got = %method, expected = %register.method, "Method not allowed");
+        let (mut r, o) = reject(StatusCode::METHOD_NOT_ALLOWED, "method_not_allowed", "Method not allowed");
+        if let Ok(v) = header::HeaderValue::from_str(&register.method) {
+            r.headers_mut().insert(header::ALLOW, v);
+        }
+        return (r, o);
+    }
+
+    // Authenticate on the raw bytes BEFORE parsing anything, so a caller who
+    // can't prove who they are learns nothing (not even JSON parse errors).
+    // The reply is always the same generic 401; the reason is logged only.
+    if let Some(a) = &register.auth {
+        if let Err(e) = auth::verify(a, headers, body.as_bytes()) {
+            warn!(endpoint = %endpoint, scheme = a.kind(), reason = e.reason(), "Webhook authentication failed");
+            return reject(StatusCode::UNAUTHORIZED, "unauthorized", "Unauthorized");
+        }
+    }
+
+    // One id for this request: shared by every target and every retry.
+    let message_id = resolve_message_id(headers);
     info!(endpoint = %endpoint, message_id = %message_id, payload_size = body.len(), "Processing webhook request");
 
-    let register = state.0.registry.registers.get(&endpoint).ok_or_else(|| {
-        warn!(endpoint = %endpoint, "Webhook endpoint not found");
-        ErrorResponse::not_found("Endpoint not found")
-    })?;
-
-    let request_data: Value = serde_json::from_str(&body)
-        .map_err(|e| ErrorResponse::bad_request(format!("Invalid JSON: {}", e)))?;
+    let request_data: Value = match serde_json::from_str(&body) {
+        Ok(v) => v,
+        Err(e) => return reject(StatusCode::BAD_REQUEST, "bad_request", &format!("Invalid JSON: {e}")),
+    };
     let template_data = json_to_template_data(&request_data);
     let hbs = &state.0.registry.handlebars;
 
@@ -104,7 +158,7 @@ async fn handle_webhook(
     let default_payload = render_template(hbs, &register.default_template, &template_data);
     if let Err(e) = &default_payload {
         if register.targets.iter().all(|t| t.own_template.is_none()) {
-            return Err(ErrorResponse::internal(e.clone()));
+            return reject(StatusCode::INTERNAL_SERVER_ERROR, "error", e);
         }
     }
     let payloads: Vec<Result<Value, String>> = register
@@ -117,8 +171,8 @@ async fn handle_webhook(
         .collect();
 
     match register.mode {
-        DispatchMode::Sync => deliver_sync(&state, &endpoint, register, &message_id, payloads).await,
-        DispatchMode::Async => accept_async(&state, &endpoint, register, &message_id, payloads).await,
+        DispatchMode::Sync => deliver_sync(state, endpoint, register, &message_id, payloads).await,
+        DispatchMode::Async => accept_async(state, endpoint, register, &message_id, payloads).await,
     }
 }
 
@@ -129,7 +183,7 @@ async fn deliver_sync(
     register: &CompiledRegister,
     message_id: &str,
     payloads: Vec<Result<Value, String>>,
-) -> ApiResult<Response> {
+) -> Outcome {
     let deliveries: Vec<Delivery> = register
         .targets
         .iter()
@@ -143,7 +197,7 @@ async fn deliver_sync(
         .collect();
 
     let total = deliveries.len();
-    let outcomes = state.0.dispatcher.broadcast(message_id, deliveries).await;
+    let outcomes = state.0.dispatcher.broadcast(endpoint, message_id, deliveries).await;
     let report = BroadcastReport::new(register.delivery, outcomes);
 
     for r in &report.results {
@@ -185,10 +239,10 @@ async fn deliver_sync(
                 .collect::<Vec<_>>()
                 .join("; "),
         );
-        return Ok((StatusCode::BAD_GATEWAY, Json(resp)).into_response());
+        return ((StatusCode::BAD_GATEWAY, Json(resp)).into_response(), "failed");
     }
 
-    Ok((StatusCode::OK, Json(resp)).into_response())
+    ((StatusCode::OK, Json(resp)).into_response(), status_text)
 }
 
 /// `mode: async` — persist one job per target, answer 202, deliver later.
@@ -199,19 +253,35 @@ async fn accept_async(
     register: &CompiledRegister,
     message_id: &str,
     payloads: Vec<Result<Value, String>>,
-) -> ApiResult<Response> {
-    let outbox = state
-        .0
-        .outbox
-        .as_ref()
-        .ok_or_else(|| ErrorResponse::internal("Async mode is enabled but the outbox is not available"))?;
+) -> Outcome {
+    let Some(outbox) = state.0.outbox.as_ref() else {
+        return reject(StatusCode::INTERNAL_SERVER_ERROR, "error", "Async mode is enabled but the outbox is not available");
+    };
 
     // All-or-nothing: never accept a message we already know we can't deliver.
     let mut jobs = Vec::with_capacity(payloads.len());
     for (j, (t, payload)) in register.targets.iter().zip(payloads).enumerate() {
-        let payload = payload.map_err(|e| ErrorResponse::internal(format!("target '{}': {e}", t.label)))?;
-        jobs.push(NewJob { target_index: j, target_label: t.label.clone(), payload: payload.to_string() });
+        match payload {
+            Ok(p) => jobs.push(NewJob { target_index: j, target_label: t.label.clone(), payload: p.to_string() }),
+            Err(e) => return reject(StatusCode::INTERNAL_SERVER_ERROR, "error", &format!("target '{}': {e}", t.label)),
+        }
     }
+
+    let accepted = |queued: usize, duplicate: bool| {
+        (
+            (
+                StatusCode::ACCEPTED,
+                Json(serde_json::json!({
+                    "status": "accepted",
+                    "message_id": message_id,
+                    "queued": queued,
+                    "duplicate": duplicate,
+                })),
+            )
+                .into_response(),
+            if duplicate { "duplicate" } else { "accepted" },
+        )
+    };
 
     match outbox
         .enqueue(message_id.to_string(), endpoint.to_string(), jobs, state.0.max_pending)
@@ -219,44 +289,44 @@ async fn accept_async(
     {
         Ok(Enqueued::Accepted(n)) => {
             info!(endpoint = %endpoint, message_id = %message_id, jobs = n, "Webhook accepted (async)");
-            Ok((
-                StatusCode::ACCEPTED,
-                Json(serde_json::json!({
-                    "status": "accepted",
-                    "message_id": message_id,
-                    "queued": n,
-                    "duplicate": false,
-                })),
-            )
-                .into_response())
+            accepted(n, false)
         }
         Ok(Enqueued::Duplicate) => {
             info!(endpoint = %endpoint, message_id = %message_id, "Duplicate webhook ignored (already accepted)");
-            Ok((
-                StatusCode::ACCEPTED,
-                Json(serde_json::json!({
-                    "status": "accepted",
-                    "message_id": message_id,
-                    "queued": 0,
-                    "duplicate": true,
-                })),
-            )
-                .into_response())
+            accepted(0, true)
         }
         Ok(Enqueued::Full) => {
             warn!(endpoint = %endpoint, max_pending = state.0.max_pending, "Outbox full, shedding load");
-            Ok((
-                StatusCode::SERVICE_UNAVAILABLE,
-                [(header::RETRY_AFTER, "5")],
-                Json(ErrorResponse::new("Outbox is full, retry later")),
-            )
-                .into_response())
+            let (mut r, o) = reject(StatusCode::SERVICE_UNAVAILABLE, "overloaded", "Outbox is full, retry later");
+            r.headers_mut().insert(header::RETRY_AFTER, header::HeaderValue::from_static("5"));
+            (r, o)
         }
         Err(e) => {
             error!(endpoint = %endpoint, error = %e, "Could not persist webhook");
-            Err(ErrorResponse::internal("Could not persist webhook"))
+            reject(StatusCode::INTERNAL_SERVER_ERROR, "error", "Could not persist webhook")
         }
     }
+}
+
+/// `GET /metrics` (only mounted when `settings.enable_metrics` is true).
+async fn handle_metrics(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Some(token) = &state.0.metrics_token {
+        if !auth::verify_bearer_token(&headers, token) {
+            return ErrorResponse::respond(StatusCode::UNAUTHORIZED, "Unauthorized");
+        }
+    }
+    // Outbox gauges come straight from the database so they are never stale.
+    if let Some(outbox) = &state.0.outbox {
+        match outbox.stats().await {
+            Ok(stats) => state.0.metrics.set_outbox(&stats),
+            Err(e) => error!(error = %e, "Could not read outbox stats for /metrics"),
+        }
+    }
+    (
+        [(header::CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")],
+        state.0.metrics.render(),
+    )
+        .into_response()
 }
 
 async fn handle_debug_request(
@@ -300,12 +370,18 @@ fn init_logging(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
 // Router  (Open/Closed — add routes without touching handler logic)
 // ---------------------------------------------------------------------------
 
-fn build_router(state: AppState, args: &Args) -> Router {
+fn build_router(state: AppState, args: &Args, enable_metrics: bool) -> Router {
     let mut app = Router::new()
         .route("/*path", any(handle_webhook))
         .route("/debug", axum::routing::post(handle_debug_request))
+        .layer(DefaultBodyLimit::max(args.max_body_bytes))
         .layer(ServiceBuilder::new().layer(TraceLayer::new_for_http()))
-        .with_state(state);
+        .with_state(state.clone());
+
+    if enable_metrics {
+        app = app.route("/metrics", get(handle_metrics).with_state(state));
+        info!("Prometheus metrics enabled at /metrics");
+    }
 
     if args.health_check_enabled {
         app = app
@@ -359,7 +435,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let registry = Arc::new(Registry::build(&config));
-    let dispatcher = Arc::new(Dispatcher::new(args.request_timeout, &config.settings));
+    let metrics = Arc::new(Metrics::new());
+    let dispatcher = Arc::new(Dispatcher::new(args.request_timeout, &config.settings, metrics.clone()));
 
     // Async mode needs the durable outbox and its delivery workers.
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -382,6 +459,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 registry: registry.clone(),
                 dispatcher: dispatcher.clone(),
                 settings: config.outbox.clone(),
+                metrics: metrics.clone(),
             },
             shutdown_rx,
         )
@@ -396,8 +474,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         dispatcher,
         outbox,
         max_pending: config.outbox.max_pending,
+        metrics,
+        metrics_token: config.settings.metrics_token.clone(),
+        limiter: Semaphore::new(args.max_concurrent_requests.max(1)),
     }));
-    let app = build_router(state, &args);
+    let app = build_router(state, &args, config.settings.enable_metrics);
 
     let addr = format!("{}:{}", args.bind_address, args.port);
     info!(addr = %addr, "Starting webhook proxy server");

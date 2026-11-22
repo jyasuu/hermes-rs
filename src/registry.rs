@@ -2,7 +2,7 @@
 //! Shared by the HTTP handler (accepting webhooks) and the outbox workers
 //! (delivering them later).
 
-use crate::config::{Config, DeliveryPolicy, DispatchMode, Target};
+use crate::config::{AuthConfig, Config, DeliveryPolicy, DispatchMode, Target};
 use crate::sink::RetryPolicy;
 use crate::template::new_handlebars;
 use handlebars::Handlebars;
@@ -20,6 +20,9 @@ pub struct CompiledTarget {
 }
 
 pub struct CompiledRegister {
+    /// Upper-case HTTP method the endpoint accepts.
+    pub method: String,
+    pub auth: Option<AuthConfig>,
     pub mode: DispatchMode,
     pub delivery: DeliveryPolicy,
     pub default_template: String,
@@ -69,7 +72,14 @@ impl Registry {
 
             registers.insert(
                 reg.endpoint.clone(),
-                CompiledRegister { mode: reg.mode, delivery: reg.delivery, default_template, targets },
+                CompiledRegister {
+                    method: reg.method.to_uppercase(),
+                    auth: reg.auth.clone(),
+                    mode: reg.mode,
+                    delivery: reg.delivery,
+                    default_template,
+                    targets,
+                },
             );
         }
 

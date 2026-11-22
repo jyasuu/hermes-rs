@@ -243,7 +243,7 @@ async fn list_endpoints(config_path: &PathBuf) -> Result<(), Box<dyn std::error:
 
     println!("📋 Registered webhook endpoints:");
     println!(
-        "{:<8} {:<28} {:<10} {:<14} {}",
+        "{:<8} {:<36} {:<10} {:<14} {}",
         "METHOD", "ENDPOINT", "TYPE", "TARGET", "DESTINATION"
     );
     println!("{}", "-".repeat(100));
@@ -251,9 +251,19 @@ async fn list_endpoints(config_path: &PathBuf) -> Result<(), Box<dyn std::error:
     for register in &config.registers {
         for (j, target) in register.all_targets().enumerate() {
             println!(
-                "{:<8} {:<28} {:<10} {:<14} {}",
+                "{:<8} {:<36} {:<10} {:<14} {}",
                 register.method,
-                format!("{}{}", register.endpoint, if register.mode == crate::config::DispatchMode::Async { " (async)" } else { "" }),
+                {
+                    let mut tags = Vec::new();
+                    if register.mode == crate::config::DispatchMode::Async {
+                        tags.push("async".to_string());
+                    }
+                    tags.push(match &register.auth {
+                        Some(a) => format!("auth:{}", a.kind()),
+                        None => "OPEN".to_string(),
+                    });
+                    format!("{} ({})", register.endpoint, tags.join(", "))
+                },
                 target.type_name(),
                 target.label(j),
                 target.describe()
@@ -261,9 +271,9 @@ async fn list_endpoints(config_path: &PathBuf) -> Result<(), Box<dyn std::error:
         }
         if register.all_targets().count() > 1 {
             if register.mode == crate::config::DispatchMode::Async {
-                println!("{:<8} {:<28} ↳ broadcast, async (targets delivered independently)", "", "");
+                println!("{:<8} {:<36} ↳ broadcast, async (targets delivered independently)", "", "");
             } else {
-                println!("{:<8} {:<28} ↳ broadcast, delivery={:?}", "", "", register.delivery);
+                println!("{:<8} {:<36} ↳ broadcast, delivery={:?}", "", "", register.delivery);
             }
         }
     }

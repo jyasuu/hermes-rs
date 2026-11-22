@@ -1,0 +1,75 @@
+# Run with:  promtool test rules tests/alerts/alerts_test.yml
+rule_files:
+  - ../../alerts.yml
+evaluation_interval: 1m
+
+tests:
+  # A dead letter appears at minute 3 -> the alert must fire; before that, quiet.
+  - interval: 1m
+    input_series:
+      - series: 'hermes_outbox_dead_lettered_total{endpoint="/w",target="api"}'
+        values: '0 0 0 1 1 1 1 1 1 1 1 1 1 1 1'
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: HermesDeadLetters
+        exp_alerts: []
+      - eval_time: 5m
+        alertname: HermesDeadLetters
+        exp_alerts:
+          - exp_labels: { severity: critical, endpoint: /w, target: api }
+            exp_annotations:
+              summary: "1 async delivery(ies) dead-lettered (/w -> api)"
+      # the counter stopped moving for >10 minutes: the alert resolves
+      - eval_time: 14m
+        alertname: HermesDeadLetters
+        exp_alerts: []
+
+  # Queue is healthy for 5 min, then the oldest job starts aging past 10 minutes.
+  - interval: 1m
+    input_series:
+      - series: 'hermes_outbox_oldest_waiting_job_age_seconds'
+        values: '0 0 0 0 0 700 760 820 880 940 1000 1060 1120'
+    alert_rule_test:
+      - eval_time: 4m
+        alertname: HermesOutboxBacklog
+        exp_alerts: []
+      - eval_time: 11m
+        alertname: HermesOutboxBacklog
+        exp_alerts:
+          - exp_labels: { severity: warning }
+            exp_annotations:
+              summary: "Oldest queued job has been waiting 17m 40s"
+
+  # Hermes disappears from Prometheus' point of view.
+  - interval: 1m
+    input_series:
+      - series: 'up{job="hermes-rs"}'
+        values: '1 1 1 0 0 0 0'
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: HermesDown
+        exp_alerts: []
+      - eval_time: 5m
+        alertname: HermesDown
+        exp_alerts:
+          - exp_labels: { severity: critical, job: hermes-rs }
+            exp_annotations: { summary: "Hermes is not responding to scrapes" }
+
+  # Healthy target: 1 failure in 100 attempts must NOT alert; 50% failing must.
+  - interval: 1m
+    input_series:
+      - series: 'hermes_delivery_attempts_total{endpoint="/w",target="ok",kind="http",result="ok"}'
+        values: '0+99x20'
+      - series: 'hermes_delivery_attempts_total{endpoint="/w",target="ok",kind="http",result="retryable_error"}'
+        values: '0+1x20'
+      - series: 'hermes_delivery_attempts_total{endpoint="/w",target="bad",kind="http",result="ok"}'
+        values: '0+50x20'
+      - series: 'hermes_delivery_attempts_total{endpoint="/w",target="bad",kind="http",result="retryable_error"}'
+        values: '0+50x20'
+    alert_rule_test:
+      - eval_time: 18m
+        alertname: HermesDeliveryFailures
+        exp_alerts:
+          - exp_labels: { severity: warning, endpoint: /w, target: bad }
+            exp_annotations:
+              summary: "Over 20% of deliveries to bad (/w) are failing"

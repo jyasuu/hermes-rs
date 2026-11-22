@@ -2,8 +2,9 @@
 
 use super::{now_ms, Job, Outbox};
 use crate::config::OutboxSettings;
+use crate::metrics::Metrics;
 use crate::registry::Registry;
-use crate::sink::{Attempt, Dispatcher};
+use crate::sink::{Attempt, DeliveryCtx, Dispatcher};
 use serde_json::Value;
 use std::{sync::Arc, time::Duration};
 use tokio::{sync::watch, task::JoinHandle};
@@ -16,6 +17,7 @@ pub struct WorkerContext {
     pub registry: Arc<Registry>,
     pub dispatcher: Arc<Dispatcher>,
     pub settings: OutboxSettings,
+    pub metrics: Arc<Metrics>,
 }
 
 /// What to do with a job after one attempt.
@@ -118,6 +120,7 @@ async fn maintenance_loop(ctx: WorkerContext, mut shutdown: watch::Receiver<bool
 async fn process(ctx: &WorkerContext, job: Job) {
     let kill = |reason: String| async {
         error!(job = job.id, endpoint = %job.endpoint, target = %job.target_label, reason = %reason, "Outbox job dead-lettered");
+        ctx.metrics.record_dead_letter(&job.endpoint, &job.target_label);
         if let Err(e) = ctx.outbox.dead(job.id, job.attempts, reason).await {
             error!(job = job.id, error = %e, "Could not mark job dead");
         }
@@ -143,7 +146,8 @@ async fn process(ctx: &WorkerContext, job: Job) {
         Err(e) => return kill(format!("stored payload is not valid JSON: {e}")).await,
     };
 
-    let outcome = ctx.dispatcher.attempt(&compiled.target, &payload, &job.message_id).await;
+    let dctx = DeliveryCtx { endpoint: &job.endpoint, target: &job.target_label };
+    let outcome = ctx.dispatcher.attempt(dctx, &compiled.target, &payload, &job.message_id).await;
     let now = now_ms();
     let verdict = match outcome {
         Attempt::Delivered(_) => Verdict::Delivered,
@@ -159,6 +163,7 @@ async fn process(ctx: &WorkerContext, job: Job) {
         (Verdict::Delivered, _) => {
             info!(job = job.id, endpoint = %job.endpoint, target = %job.target_label,
                   message_id = %job.message_id, attempts = job.attempts + 1, "Outbox job delivered");
+            ctx.metrics.record_outbox_delivered(&job.endpoint, &job.target_label);
             ctx.outbox.complete(job.id, job.attempts + 1).await
         }
         (Verdict::Defer { at }, _) => {
@@ -175,6 +180,7 @@ async fn process(ctx: &WorkerContext, job: Job) {
         (Verdict::Dead, Attempt::Failed(e)) => {
             error!(job = job.id, endpoint = %job.endpoint, target = %job.target_label,
                    attempts = job.attempts + 1, error = %e, "Outbox job dead-lettered");
+            ctx.metrics.record_dead_letter(&job.endpoint, &job.target_label);
             ctx.outbox.dead(job.id, job.attempts + 1, e.message.clone()).await
         }
         _ => Ok(()),

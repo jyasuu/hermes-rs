@@ -1,7 +1,9 @@
 pub mod admin;
+pub mod auth;
 pub mod config;
 pub mod health;
 pub mod idempotency;
+pub mod metrics;
 pub mod outbox;
 pub mod registry;
 pub mod sink;

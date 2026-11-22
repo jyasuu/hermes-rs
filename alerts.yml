@@ -1,0 +1,57 @@
+# Alert rules for Hermes. Mounted by docker-compose.12factor.yml.
+groups:
+  - name: hermes
+    rules:
+      - alert: HermesDown
+        expr: up{job="hermes-rs"} == 0
+        for: 1m
+        labels: { severity: critical }
+        annotations:
+          summary: "Hermes is not responding to scrapes"
+
+      # Async jobs that gave up. Nothing else tells you: the sender already got a 202.
+      # Investigate:  hermes-admin outbox list --state dead   |   fix, then: outbox replay
+      - alert: HermesDeadLetters
+        expr: increase(hermes_outbox_dead_lettered_total[10m]) > 0
+        labels: { severity: critical }
+        annotations:
+          summary: "{{ $value | printf \"%.0f\" }} async delivery(ies) dead-lettered ({{ $labels.endpoint }} -> {{ $labels.target }})"
+
+      - alert: HermesDeadLetterBacklog
+        expr: hermes_outbox_jobs{state="dead"} > 0
+        for: 1h
+        labels: { severity: warning }
+        annotations:
+          summary: "Dead letters have been waiting for replay for over an hour"
+
+      # Grows while a destination is down; stays near zero when healthy.
+      - alert: HermesOutboxBacklog
+        expr: hermes_outbox_oldest_waiting_job_age_seconds > 600
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "Oldest queued job has been waiting {{ $value | humanizeDuration }}"
+
+      - alert: HermesDeliveryFailures
+        expr: |
+          sum by (endpoint, target) (rate(hermes_delivery_attempts_total{result!="ok"}[5m]))
+            / sum by (endpoint, target) (rate(hermes_delivery_attempts_total[5m])) > 0.2
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "Over 20% of deliveries to {{ $labels.target }} ({{ $labels.endpoint }}) are failing"
+
+      # A burst of 401s = a wrong secret after a rotation, or someone probing.
+      - alert: HermesAuthRejections
+        expr: sum by (endpoint) (rate(hermes_webhook_requests_total{outcome="unauthorized"}[5m])) > 1
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "Sustained rejected requests on {{ $labels.endpoint }} (bad secret or probing)"
+
+      - alert: HermesShedding
+        expr: sum(rate(hermes_webhook_requests_total{outcome="overloaded"}[5m])) > 0
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "Hermes is rejecting requests with 503 (concurrency limit or outbox full)"

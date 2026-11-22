@@ -34,6 +34,10 @@ pub struct Args {
     #[arg(long, env = "HERMES_MAX_CONCURRENT_REQUESTS", default_value = "1000")]
     pub max_concurrent_requests: usize,
 
+    /// Reject webhook bodies larger than this many bytes (HTTP 413)
+    #[arg(long, env = "HERMES_MAX_BODY_BYTES", default_value = "2097152")]
+    pub max_body_bytes: usize,
+
     /// Health check endpoint
     #[arg(long, env = "HERMES_HEALTH_CHECK_ENABLED", default_value = "true")]
     pub health_check_enabled: bool,
@@ -55,8 +59,13 @@ pub struct AppSettings {
     pub retry_attempts: u32,
     #[serde(default = "default_retry_delay_ms")]
     pub retry_delay_ms: u64,
+    /// Expose Prometheus metrics at `GET /metrics`.
     #[serde(default = "default_enable_metrics")]
     pub enable_metrics: bool,
+    /// If set, `/metrics` requires `Authorization: Bearer <token>`.
+    /// Use `${ENV_VAR}` to keep it out of the file.
+    #[serde(default)]
+    pub metrics_token: Option<String>,
     #[serde(default)]
     pub circuit_breaker: CircuitBreakerSettings,
 }
@@ -67,6 +76,7 @@ impl Default for AppSettings {
             retry_attempts: default_retry_attempts(),
             retry_delay_ms: default_retry_delay_ms(),
             enable_metrics: default_enable_metrics(),
+            metrics_token: None,
             circuit_breaker: CircuitBreakerSettings::default(),
         }
     }
@@ -203,6 +213,10 @@ impl Default for OutboxSettings {
 pub struct WebhookRegister {
     pub endpoint: String,
     pub method: String,
+    /// Authenticate the *sender*. Without it anyone who can reach Hermes can
+    /// trigger this endpoint.
+    #[serde(default)]
+    pub auth: Option<AuthConfig>,
     /// Single destination (original syntax, still supported).
     #[serde(default)]
     pub target: Option<Target>,
@@ -259,6 +273,121 @@ impl DeliveryPolicy {
             DeliveryPolicy::BestEffort => true,
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Inbound authentication
+// ---------------------------------------------------------------------------
+
+/// How a register verifies that a request really comes from its sender.
+/// Verification happens on the raw body, before anything is parsed.
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum AuthConfig {
+    /// HMAC signature of the request body (GitHub, Gitea, Shopify, …).
+    Hmac(HmacAuth),
+    /// Shared token (`Authorization: Bearer …`, or a custom header such as
+    /// GitLab's `X-Gitlab-Token`).
+    Bearer(BearerAuth),
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HmacAuth {
+    /// Shared secret; use `${ENV_VAR}` to keep it out of the file.
+    pub secret: String,
+    /// Header carrying the signature.
+    #[serde(default = "default_signature_header")]
+    pub header: String,
+    #[serde(default)]
+    pub algorithm: HmacAlgorithm,
+    #[serde(default)]
+    pub encoding: SignatureEncoding,
+    /// Text before the signature in the header. Default: `sha256=` / `sha1=`
+    /// for hex (GitHub style), none for base64 (Shopify style).
+    #[serde(default)]
+    pub prefix: Option<String>,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct BearerAuth {
+    pub token: String,
+    /// `None`: expect `Authorization: Bearer <token>`.
+    /// `Some(h)`: expect the header `h` to hold exactly the token.
+    #[serde(default)]
+    pub header: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HmacAlgorithm {
+    #[default]
+    Sha256,
+    /// Legacy senders only (e.g. GitHub's `X-Hub-Signature`).
+    Sha1,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SignatureEncoding {
+    #[default]
+    Hex,
+    Base64,
+}
+
+impl HmacAuth {
+    /// The prefix actually expected in front of the signature.
+    pub fn expected_prefix(&self) -> String {
+        match (&self.prefix, self.encoding, self.algorithm) {
+            (Some(p), _, _) => p.clone(),
+            (None, SignatureEncoding::Base64, _) => String::new(),
+            (None, SignatureEncoding::Hex, HmacAlgorithm::Sha256) => "sha256=".to_string(),
+            (None, SignatureEncoding::Hex, HmacAlgorithm::Sha1) => "sha1=".to_string(),
+        }
+    }
+}
+
+impl AuthConfig {
+    pub fn kind(&self) -> &'static str {
+        match self {
+            AuthConfig::Hmac(_) => "hmac",
+            AuthConfig::Bearer(_) => "bearer",
+        }
+    }
+}
+
+// Secrets must never reach a log line through a stray `{:?}`.
+impl std::fmt::Debug for HmacAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HmacAuth")
+            .field("secret", &"<redacted>")
+            .field("header", &self.header)
+            .field("algorithm", &self.algorithm)
+            .field("encoding", &self.encoding)
+            .field("prefix", &self.prefix)
+            .finish()
+    }
+}
+impl std::fmt::Debug for BearerAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BearerAuth")
+            .field("token", &"<redacted>")
+            .field("header", &self.header)
+            .finish()
+    }
+}
+impl std::fmt::Debug for AuthConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AuthConfig::Hmac(a) => a.fmt(f),
+            AuthConfig::Bearer(a) => a.fmt(f),
+        }
+    }
+}
+
+fn default_signature_header() -> String {
+    "X-Hub-Signature-256".to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -526,6 +655,50 @@ fn default_true() -> bool {
     true
 }
 
+/// `${VAR}`, `${VAR:-default}`, and `$$` for a literal `$`.
+/// An unset variable without a default is an error: failing at startup beats
+/// quietly running with an empty secret.
+pub fn expand_env(input: &str, lookup: &dyn Fn(&str) -> Option<String>) -> Result<String, String> {
+    let mut out = String::with_capacity(input.len());
+    let mut chars = input.char_indices().peekable();
+    while let Some((i, c)) = chars.next() {
+        if c != '$' {
+            out.push(c);
+            continue;
+        }
+        match chars.peek() {
+            Some((_, '$')) => {
+                chars.next();
+                out.push('$');
+            }
+            Some((_, '{')) => {
+                chars.next();
+                let start = i + 2;
+                let end = input[start..].find('}').map(|e| start + e).ok_or("unterminated '${'")?;
+                let (name, default) = match input[start..end].split_once(":-") {
+                    Some((n, d)) => (n, Some(d)),
+                    None => (&input[start..end], None),
+                };
+                let valid = name.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+                    && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+                if !valid {
+                    return Err(format!("invalid variable name '{name}' in '${{…}}'"));
+                }
+                match lookup(name).filter(|v| !v.is_empty()).or(default.map(str::to_string)) {
+                    Some(v) => out.push_str(&v),
+                    None => return Err(format!("environment variable {name} is not set")),
+                }
+                // skip past the closing brace
+                while chars.peek().is_some_and(|(j, _)| *j <= end) {
+                    chars.next();
+                }
+            }
+            _ => out.push('$'),
+        }
+    }
+    Ok(out)
+}
+
 impl Config {
     pub async fn load(path: &PathBuf) -> Result<Self, Box<dyn std::error::Error>> {
         let content = tokio::fs::read_to_string(path).await?;
@@ -533,8 +706,43 @@ impl Config {
     }
 
     pub fn from_yaml(content: &str) -> Result<Self, Box<dyn std::error::Error>> {
-        let config: Config = serde_yaml::from_str(content)?;
+        let mut config: Config = serde_yaml::from_str(content)?;
+        config.expand_env_vars(&|name| std::env::var(name).ok())?;
         Ok(config)
+    }
+
+    /// Replaces `${VAR}` / `${VAR:-default}` in the fields that hold
+    /// credentials and addresses: auth secrets, target URLs and header
+    /// values, the metrics token. Templates are deliberately NOT touched, so a
+    /// `${…}` inside a payload template stays literal. `$$` is a literal `$`.
+    pub fn expand_env_vars(&mut self, lookup: &dyn Fn(&str) -> Option<String>) -> Result<(), String> {
+        fn ex(v: &mut String, at: &str, lookup: &dyn Fn(&str) -> Option<String>) -> Result<(), String> {
+            *v = expand_env(v, lookup).map_err(|e| format!("{at}: {e}"))?;
+            Ok(())
+        }
+        if let Some(t) = &mut self.settings.metrics_token {
+            ex(t, "settings.metrics_token", lookup)?;
+        }
+        for reg in &mut self.registers {
+            let at = reg.endpoint.clone();
+            match &mut reg.auth {
+                Some(AuthConfig::Hmac(a)) => ex(&mut a.secret, &format!("{at}: auth.secret"), lookup)?,
+                Some(AuthConfig::Bearer(a)) => ex(&mut a.token, &format!("{at}: auth.token"), lookup)?,
+                None => {}
+            }
+            for t in reg.target.iter_mut().chain(reg.targets.iter_mut()) {
+                let (url, headers) = match &mut t.kind {
+                    TargetKind::Http(h) => (&mut h.url, &mut h.headers),
+                    TargetKind::Rabbitmq(r) => (&mut r.url, &mut r.headers),
+                    TargetKind::Nats(n) => (&mut n.url, &mut n.headers),
+                };
+                ex(url, &format!("{at}: target url"), lookup)?;
+                for (k, v) in headers.iter_mut() {
+                    ex(v, &format!("{at}: header '{k}'"), lookup)?;
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Outbox database path; `HERMES_OUTBOX_PATH` wins over the file.
@@ -562,6 +770,9 @@ impl Config {
         if cb.enabled && (cb.failure_threshold == 0 || cb.cooldown_secs == 0) {
             return Err("settings.circuit_breaker: failure_threshold and cooldown_secs must be >= 1".into());
         }
+        if self.settings.metrics_token.as_deref() == Some("") {
+            return Err("settings.metrics_token cannot be empty".into());
+        }
         let ob = &self.outbox;
         if ob.workers == 0 || ob.lease_secs == 0 || ob.poll_interval_ms == 0 || ob.max_pending == 0 {
             return Err("outbox: workers, lease_secs, poll_interval_ms and max_pending must be >= 1".into());
@@ -584,6 +795,28 @@ impl Config {
             }
             if !seen.insert(reg.endpoint.as_str()) {
                 return Err(format!("{at}: duplicate endpoint"));
+            }
+            if ["/health", "/ready", "/metrics", "/debug"].contains(&reg.endpoint.as_str()) {
+                return Err(format!("{at}: this path is reserved for Hermes itself"));
+            }
+            match &reg.auth {
+                Some(AuthConfig::Hmac(a)) => {
+                    if a.secret.is_empty() {
+                        return Err(format!("{at}: auth.secret cannot be empty"));
+                    }
+                    reqwest::header::HeaderName::from_bytes(a.header.as_bytes())
+                        .map_err(|e| format!("{at}: auth.header '{}' is not a valid header name: {e}", a.header))?;
+                }
+                Some(AuthConfig::Bearer(a)) => {
+                    if a.token.is_empty() {
+                        return Err(format!("{at}: auth.token cannot be empty"));
+                    }
+                    if let Some(h) = &a.header {
+                        reqwest::header::HeaderName::from_bytes(h.as_bytes())
+                            .map_err(|e| format!("{at}: auth.header '{h}' is not a valid header name: {e}"))?;
+                    }
+                }
+                None => {}
             }
             if !valid_methods.contains(&reg.method.to_uppercase().as_str()) {
                 return Err(format!("{at}: invalid HTTP method '{}'", reg.method));
@@ -861,5 +1094,94 @@ registers:
             "outbox: { lease_secs: 10 }\nregisters:\n  - { endpoint: /a, method: POST, template: '{}', target: { url: 'http://x', timeout_seconds: 99 } }\n",
         );
         sync_ok.validate().unwrap();
+    }
+
+    fn env(pairs: &'static [(&'static str, &'static str)]) -> impl Fn(&str) -> Option<String> {
+        move |k| pairs.iter().find(|(n, _)| *n == k).map(|(_, v)| v.to_string())
+    }
+
+    #[test]
+    fn env_expansion_rules() {
+        let e = env(&[("A", "alpha"), ("EMPTY", "")]);
+        assert_eq!(expand_env("x-${A}-y", &e).unwrap(), "x-alpha-y");
+        assert_eq!(expand_env("${MISSING:-fallback}", &e).unwrap(), "fallback");
+        assert_eq!(expand_env("${EMPTY:-d}", &e).unwrap(), "d", "empty counts as unset");
+        assert_eq!(expand_env("cost $$5 and $ alone", &e).unwrap(), "cost $5 and $ alone");
+        assert_eq!(expand_env("${A}${A}", &e).unwrap(), "alphaalpha");
+        assert_eq!(expand_env("é${A}é", &e).unwrap(), "éalphaé", "multi-byte text survives");
+        assert!(expand_env("${MISSING}", &e).unwrap_err().contains("MISSING is not set"));
+        assert!(expand_env("${A", &e).unwrap_err().contains("unterminated"));
+        assert!(expand_env("${1bad}", &e).unwrap_err().contains("invalid variable name"));
+    }
+
+    #[test]
+    fn env_is_expanded_in_secrets_and_urls_but_never_in_templates() {
+        let mut cfg: Config = serde_yaml::from_str(
+            r#"
+settings: { metrics_token: "${TOK}" }
+registers:
+  - endpoint: /w
+    method: POST
+    auth: { type: hmac, secret: "${SECRET}" }
+    template: 'cost ${NOT_EXPANDED}'
+    target: { type: rabbitmq, url: "amqp://u:${PW}@mq/%2f", routing_key: q, headers: { X-K: "${TOK}" } }
+"#,
+        )
+        .unwrap();
+        cfg.expand_env_vars(&env(&[("SECRET", "s3"), ("PW", "pw"), ("TOK", "tk")])).unwrap();
+        assert_eq!(cfg.settings.metrics_token.as_deref(), Some("tk"));
+        assert!(matches!(&cfg.registers[0].auth, Some(AuthConfig::Hmac(a)) if a.secret == "s3"));
+        assert_eq!(cfg.registers[0].template, "cost ${NOT_EXPANDED}");
+        match &cfg.registers[0].target.as_ref().unwrap().kind {
+            TargetKind::Rabbitmq(r) => assert_eq!((r.url.as_str(), r.headers["X-K"].as_str()), ("amqp://u:pw@mq/%2f", "tk")),
+            _ => panic!(),
+        }
+        let mut missing: Config = serde_yaml::from_str(
+            "registers:\n  - { endpoint: /w, method: POST, template: '{}', auth: { type: bearer, token: '${NOPE}' }, target: { url: 'http://a' } }\n",
+        )
+        .unwrap();
+        let err = missing.expand_env_vars(&env(&[])).unwrap_err();
+        assert!(err.contains("/w") && err.contains("NOPE"), "{err}");
+    }
+
+    #[test]
+    fn auth_parses_with_defaults_and_validates() {
+        let cfg = parse(
+            r#"
+registers:
+  - { endpoint: /gh, method: POST, template: '{}', target: { url: "http://a" }, auth: { type: hmac, secret: s } }
+  - { endpoint: /sh, method: POST, template: '{}', target: { url: "http://a" }, auth: { type: hmac, secret: s, header: X-Shopify-Hmac-Sha256, encoding: base64 } }
+  - { endpoint: /old, method: POST, template: '{}', target: { url: "http://a" }, auth: { type: hmac, secret: s, header: X-Hub-Signature, algorithm: sha1 } }
+  - { endpoint: /gl, method: POST, template: '{}', target: { url: "http://a" }, auth: { type: bearer, token: t, header: X-Gitlab-Token } }
+"#,
+        );
+        cfg.validate().unwrap();
+        let prefix = |i: usize| match &cfg.registers[i].auth {
+            Some(AuthConfig::Hmac(a)) => a.expected_prefix(),
+            _ => String::new(),
+        };
+        assert_eq!((prefix(0), prefix(1), prefix(2)), ("sha256=".into(), "".into(), "sha1=".into()));
+        assert!(matches!(&cfg.registers[0].auth, Some(AuthConfig::Hmac(a)) if a.header == "X-Hub-Signature-256"));
+    }
+
+    #[test]
+    fn auth_errors_are_caught() {
+        let empty = parse("registers:\n  - { endpoint: /w, method: POST, template: '{}', target: { url: 'http://a' }, auth: { type: hmac, secret: '' } }\n");
+        assert!(empty.validate().unwrap_err().contains("secret cannot be empty"));
+        let bad_header = parse("registers:\n  - { endpoint: /w, method: POST, template: '{}', target: { url: 'http://a' }, auth: { type: bearer, token: t, header: 'bad header' } }\n");
+        assert!(bad_header.validate().unwrap_err().contains("valid header name"));
+        assert!(Config::from_yaml("registers:\n  - { endpoint: /w, method: POST, template: '{}', target: { url: 'http://a' }, auth: { type: hmac, secret: s, heder: X } }\n").is_err(), "typo'd field rejected");
+        assert!(Config::from_yaml("registers:\n  - { endpoint: /w, method: POST, template: '{}', target: { url: 'http://a' }, auth: { type: oauth } }\n").is_err());
+    }
+
+    #[test]
+    fn reserved_paths_are_rejected_and_secrets_are_redacted_in_debug() {
+        for p in ["/health", "/ready", "/metrics", "/debug"] {
+            let cfg = parse(&format!("registers:\n  - {{ endpoint: {p}, method: POST, template: '{{}}', target: {{ url: 'http://a' }} }}\n"));
+            assert!(cfg.validate().unwrap_err().contains("reserved"), "{p}");
+        }
+        let cfg = parse("registers:\n  - { endpoint: /w, method: POST, template: '{}', target: { url: 'http://a' }, auth: { type: hmac, secret: topsecret } }\n");
+        let dbg = format!("{:?}", cfg);
+        assert!(!dbg.contains("topsecret") && dbg.contains("redacted"), "{dbg}");
     }
 }

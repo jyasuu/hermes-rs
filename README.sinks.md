@@ -147,11 +147,82 @@ dead letters. They are safe to run while the server is up. In Docker:
   event B can reach a target before event A. Consumers must tolerate repeats
   (use the idempotency key) and must not depend on order.
 * The sender only learns "accepted", not the eventual outcome. **Watch for dead
-  letters** (`outbox stats`, `dead N`) — nothing alerts you yet.
+  letters**: `hermes_outbox_dead_lettered_total` / `hermes_outbox_jobs{state="dead"}`
+  (see *Metrics & alerting*), or `hermes-admin outbox stats`.
 * The file holds rendered payloads **in clear text** (created `0600`); treat it
   like the webhooks themselves.
 * `HERMES_REQUEST_TIMEOUT` must be below `outbox.lease_secs` (default 300);
   Hermes refuses to start otherwise.
+
+## Inbound authentication
+
+Without `auth:` **anyone who can reach Hermes can trigger the endpoint** (and,
+in async mode, fill the outbox). Add it per register:
+
+```yaml
+- endpoint: /webhook/github
+  auth: { type: hmac, secret: "${GITHUB_WEBHOOK_SECRET}" }          # GitHub, Gitea: X-Hub-Signature-256: sha256=<hex>
+- endpoint: /webhook/shopify
+  auth: { type: hmac, secret: "${SHOPIFY_SECRET}", header: X-Shopify-Hmac-Sha256, encoding: base64 }
+- endpoint: /webhook/legacy
+  auth: { type: hmac, secret: "${S}", header: X-Hub-Signature, algorithm: sha1 }   # sha1 only for senders that can't do better
+- endpoint: /webhook/gitlab
+  auth: { type: bearer, token: "${GITLAB_TOKEN}", header: X-Gitlab-Token }       # raw token in a custom header
+- endpoint: /webhook/internal
+  auth: { type: bearer, token: "${RELAY_TOKEN}" }                                # Authorization: Bearer <token>
+```
+
+* The HMAC is computed over the **exact raw request body**; hex/base64 and the
+  `prefix` (default `sha256=` for hex, none for base64) are configurable.
+* Verification happens **before the body is parsed**. Every failure — missing,
+  malformed or wrong credential, any scheme — returns the same
+  `401 {"error":"Unauthorized"}`; the reason is only written to the server log
+  (never the credential). Comparisons are constant-time.
+* A body-only HMAC can be **replayed** by someone who captured a valid request.
+  Async registers with a stable sender key (`X-GitHub-Delivery`, `Idempotency-Key`)
+  discard replays within `outbox.delivered_retention_secs`; sync registers do not.
+* `hermes-admin list-endpoints` marks unauthenticated endpoints `OPEN`.
+
+### Secrets from the environment
+`${VAR}` and `${VAR:-default}` are expanded in **auth secrets/tokens, target
+URLs, target header values and `settings.metrics_token`** — so credentials
+(`amqp://user:${RABBIT_PW}@…`) stay out of the file. An unset variable with no
+default **stops startup** with a message naming it. `$$` is a literal `$`.
+Payload **templates are never expanded**. Note `hermes-admin validate-config`
+needs the same variables set.
+
+## Metrics & alerting
+
+Set `settings.enable_metrics: true` to serve Prometheus metrics at `GET /metrics`
+(optionally behind `settings.metrics_token`). Labels come only from your
+configuration, never from request data, so scanners cannot create new series.
+
+| metric | meaning |
+|---|---|
+| `hermes_webhook_requests_total{endpoint,outcome}` | outcome: `success` `partial` `failed` (sync), `accepted` `duplicate` (async), `unauthorized` `bad_request` `method_not_allowed` `not_found` `overloaded` `error`. Unknown URLs are all counted under `endpoint="unknown"` |
+| `hermes_delivery_attempts_total{endpoint,target,kind,result}` | every attempt incl. retries; result: `ok` `retryable_error` `permanent_error` `circuit_open` |
+| `hermes_delivery_attempt_duration_seconds{kind}` | histogram of attempt latency |
+| `hermes_outbox_jobs{state}` | pending / in_flight / delivered / dead — read from the database at scrape time |
+| `hermes_outbox_oldest_waiting_job_age_seconds` | backlog age; grows during an outage |
+| `hermes_outbox_dead_lettered_total{endpoint,target}` | **alert on this** |
+| `hermes_outbox_jobs_delivered_total{endpoint,target}` | async successes |
+
+Counters live in memory and reset on restart (Prometheus handles that);
+the `hermes_outbox_jobs` gauges come from the database and survive restarts.
+
+`alerts.yml` ships rules for: Hermes down, dead letters, dead-letter backlog,
+outbox backlog, delivery-failure ratio, auth-rejection bursts and load shedding.
+They are covered by `promtool test rules tests/alerts/alerts_test.yml`.
+The bundled `prometheus.yml` / compose file already load them.
+
+## Request limits & strictness
+* `HERMES_MAX_CONCURRENT_REQUESTS` (default 1000) is now enforced: beyond it
+  Hermes answers `503` + `Retry-After: 1` instead of queueing without bound.
+* `HERMES_MAX_BODY_BYTES` (default 2 MiB): larger bodies get `413`.
+* A register's `method:` is now **enforced** (`405` + `Allow` otherwise); it was
+  previously validated but ignored.
+* `/health`, `/ready`, `/metrics` and `/debug` are reserved; a register on one of
+  those paths is rejected at startup (it could never have been reached).
 
 ## Admin CLI
 
@@ -165,6 +236,7 @@ NATS subjects, duplicate endpoints and every (per-target) template.
 cargo test                                    # unit tests
 docker compose -f docker-compose.brokers.yml up -d
 cargo build && python3 tests/e2e/run.py       # needs: pip install nats-py pika
+promtool test rules tests/alerts/alerts_test.yml   # alert rules
 ```
 The e2e suite also `kill -9`s Hermes mid-test to prove the outbox loses nothing,
 and exercises dead letters and replay through the real `hermes-admin` binary.

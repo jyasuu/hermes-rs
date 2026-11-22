@@ -1,4 +1,4 @@
-import asyncio, json, subprocess, time, urllib.request, urllib.error, os, sys, threading
+import asyncio, hashlib, hmac as _hmac, base64, json, subprocess, time, urllib.request, urllib.error, os, sys, threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import nats, pika
 
@@ -30,6 +30,7 @@ class H(BaseHTTPRequestHandler):
         elif self.path == "/aflaky" and n <= 2: code = 500
         elif self.path == "/dlq" and not HEALTHY["dlq"]: code = 500
         elif self.path == "/slow": time.sleep(1.5)
+        elif self.path == "/slow2": time.sleep(1.5)
         body = json.dumps({"seen": n}).encode()
         self.send_response(code)
         for k, v in extra.items(): self.send_header(k, v)
@@ -44,9 +45,29 @@ ROOT = os.path.dirname(os.path.abspath(__file__))
 CFG = os.path.join(ROOT, "config.yml")
 OUTBOX = "/tmp/hermes-e2e-outbox/outbox.db"
 HERMES = {"p": None}
-def hermes_env():
-    return dict(os.environ, HERMES_CONFIG_PATH=CFG, HERMES_LOG_FORMAT="json", HERMES_LOG_LEVEL="info",
-                HERMES_OUTBOX_PATH=OUTBOX)
+def hermes_env(**extra):
+    env = dict(os.environ, HERMES_CONFIG_PATH=CFG, HERMES_LOG_FORMAT="json", HERMES_LOG_LEVEL="info",
+               HERMES_OUTBOX_PATH=OUTBOX, E2E_METRICS_TOKEN="metrics-tok", E2E_SHOPIFY_SECRET="shop-secret")
+    env.update(extra)
+    return env
+
+def http_req(path, data=None, headers=None, method="POST", port=3000):
+    r = urllib.request.Request(f"http://127.0.0.1:{port}{path}", data=data, method=method, headers=headers or {})
+    try:
+        with urllib.request.urlopen(r, timeout=20) as resp: return resp.status, {k.lower(): v for k, v in resp.headers.items()}, resp.read()
+    except urllib.error.HTTPError as e: return e.code, {k.lower(): v for k, v in e.headers.items()}, e.read()
+
+def hex_sig(secret, body): return "sha256=" + _hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
+def b64_sig(secret, body): return base64.b64encode(_hmac.new(secret.encode(), body, hashlib.sha256).digest()).decode()
+
+def metric(text, series):
+    """Value of an exact series line, e.g. 'hermes_x_total{a="b"}', or None."""
+    for line in text.splitlines():
+        if line.startswith(series + " "): return float(line.rsplit(" ", 1)[1])
+    return None
+def scrape(token="metrics-tok"):
+    s, h, b = http_req("/metrics", method="GET", headers={"Authorization": f"Bearer {token}"} if token else {})
+    return s, b.decode()
 def start_hermes():
     HERMES["p"] = subprocess.Popen([os.environ.get("HERMES_BIN", "target/debug/hermes-rs")], env=hermes_env(),
                                    stdout=open(os.environ.get("HERMES_E2E_LOG", "/tmp/hermes-e2e.log"), "a"),
@@ -296,6 +317,130 @@ async def main():
         check("slow: orphaned in-flight job redelivered after restart (at-least-once)", ok and len(keys) >= 2, (COUNTS.get("/slow"), keys))
         check("slow: redelivery carries the SAME key so the consumer can dedupe", set(keys) == {"slow-1"}, keys)
         crash_srv.shutdown()
+
+
+        # ============================ inbound authentication ============================
+        N0 = COUNTS.get("/auth-ok", 0)
+        body = b'{"action": "opened"}'
+        s, h, b = http_req("/webhook/auth-github", body, {"X-Hub-Signature-256": hex_sig("gh-secret", body)})
+        check("auth hmac: valid signature => 200 and delivered", s == 200 and COUNTS.get("/auth-ok") == N0 + 1, (s, b))
+
+        s, h, b = http_req("/webhook/auth-github", body, {"X-Hub-Signature-256": hex_sig("wrong", body)})
+        check("auth hmac: wrong secret => 401, generic body", s == 401 and json.loads(b) == {"error": "Unauthorized"}, (s, b))
+        s, h, b = http_req("/webhook/auth-github", body)
+        check("auth hmac: missing header => 401 (same body, nothing to probe)", s == 401 and json.loads(b) == {"error": "Unauthorized"}, (s, b))
+        s, h, b = http_req("/webhook/auth-github", b'{"action": "CLOSED"}', {"X-Hub-Signature-256": hex_sig("gh-secret", body)})
+        check("auth hmac: tampered body => 401", s == 401, (s, b))
+        s, h, b = http_req("/webhook/auth-github", body, {"X-Hub-Signature-256": "sha256=nothex"})
+        check("auth hmac: malformed signature => 401, no crash", s == 401, (s, b))
+        check("auth: rejected requests never reached the target", COUNTS.get("/auth-ok") == N0 + 1, COUNTS.get("/auth-ok"))
+
+        s, h, b = http_req("/webhook/auth-github", b"this is not json")
+        check("auth runs BEFORE parsing: bad JSON + no signature => 401, not 400", s == 401, (s, b))
+        junk = b"this is not json"
+        s, h, b = http_req("/webhook/auth-github", junk, {"X-Hub-Signature-256": hex_sig("gh-secret", junk)})
+        check("auth: bad JSON WITH a valid signature => 400", s == 400, (s, b))
+
+        s, h, b = http_req("/webhook/auth-shopify", body, {"X-Shopify-Hmac-Sha256": b64_sig("shop-secret", body)})
+        check("auth hmac: base64 + secret read from ${ENV}", s == 200, (s, b))
+        s, h, b = http_req("/webhook/auth-shopify", body, {"X-Shopify-Hmac-Sha256": b64_sig("${E2E_SHOPIFY_SECRET}", body)})
+        check("auth: the literal '${…}' text is not accepted as the secret", s == 401, (s, b))
+
+        s, h, b = http_req("/webhook/auth-bearer", body, {"Authorization": "Bearer tok-123"})
+        check("auth bearer: valid token => 200", s == 200, (s, b))
+        s, h, b = http_req("/webhook/auth-bearer", body, {"Authorization": "Bearer tok-124"})
+        check("auth bearer: wrong token => 401", s == 401, (s, b))
+        s, h, b = http_req("/webhook/auth-bearer", body, {"Authorization": "tok-123"})
+        check("auth bearer: missing scheme => 401", s == 401, (s, b))
+        s, h, b = http_req("/webhook/auth-gitlab", body, {"X-Gitlab-Token": "glpat-xyz"})
+        check("auth bearer: custom header (GitLab) => 200", s == 200, (s, b))
+        s, h, b = http_req("/webhook/auth-gitlab", body, {"Authorization": "Bearer glpat-xyz"})
+        check("auth bearer: custom-header endpoint ignores Authorization => 401", s == 401, (s, b))
+
+        # auth protects the outbox too
+        before = admin("stats")[1]
+        s, h, b = http_req("/webhook/auth-async", body, {"X-Hub-Signature-256": hex_sig("nope", body)})
+        check("auth + async: bad signature => 401 and NOTHING queued", s == 401 and admin("stats")[1] == before, (s, b))
+        s, h, b = http_req("/webhook/auth-async", body, {"X-Hub-Signature-256": hex_sig("gh-secret", body), "Idempotency-Key": "auth-async-1"})
+        check("auth + async: valid signature => 202", s == 202 and json.loads(b)["queued"] == 1, (s, b))
+
+        # unknown endpoint is still a plain 404 (no auth to evaluate)
+        s, h, b = http_req("/webhook/does-not-exist", body)
+        check("unknown endpoint => 404", s == 404, s)
+
+        # ---- the declared method is enforced ----
+        s, h, b = http_req("/webhook/legacy", method="GET")
+        check("method enforced: GET on a POST endpoint => 405 + Allow: POST", s == 405 and h.get("allow") == "POST", (s, h))
+
+        # ---- body size limit ----
+        big = json.dumps({"message": "x" * 3_000_000}).encode()
+        try: s, h, b = http_req("/webhook/legacy", big)
+        except Exception as e: s = f"conn-error {type(e).__name__}"
+        check("body limit: 3 MB payload => 413", s == 413, s)
+
+        # ================================== metrics ==================================
+        s, text = scrape(token=None)
+        check("metrics: no token => 401", s == 401, s)
+        s, text = scrape(token="wrong")
+        check("metrics: wrong token => 401", s == 401, s)
+        s, text = scrape()
+        check("metrics: valid token => 200 Prometheus text", s == 200 and "# TYPE hermes_webhook_requests_total counter" in text, s)
+
+        R = lambda ep, out: metric(text, f'hermes_webhook_requests_total{{endpoint="{ep}",outcome="{out}"}}')
+        check("metrics: request outcomes counted exactly (hmac: 1 success, 5 unauthorized, 1 bad-json-after-auth)",
+              R("/webhook/auth-github", "success") == 1 and R("/webhook/auth-github", "unauthorized") == 5 and R("/webhook/auth-github", "bad_request") == 1,
+              [l for l in text.splitlines() if "auth-github" in l and "requests_total" in l])
+        check("metrics: async accepted counted", R("/webhook/auth-async", "accepted") == 1 and R("/webhook/auth-async", "unauthorized") == 1, text[:0])
+        check("metrics: 405 counted", R("/webhook/legacy", "method_not_allowed") == 1)
+        check("metrics: delivery attempts labelled by endpoint/target/kind/result",
+              metric(text, 'hermes_delivery_attempts_total{endpoint="/webhook/auth-github",kind="http",result="ok",target="http:0"}') == 1)
+        check("metrics: attempt-duration histogram present", (metric(text, 'hermes_delivery_attempt_duration_seconds_count{kind="http"}') or 0) >= 1)
+        check("metrics: build info present", 'hermes_build_info{version="' in text)
+
+        # cardinality: random unknown URLs must NOT create series
+        for i in range(25): http_req(f"/random/scan/{i}", b"{}")
+        s, text = scrape()
+        series = [l for l in text.splitlines() if l.startswith("hermes_webhook_requests_total") and "not_found" in l]
+        check("metrics: 25 random URLs => ONE 'unknown' series, no per-URL labels",
+              len(series) == 1 and 'endpoint="unknown"' in series[0] and series[0].endswith(" 26"), series)
+
+        # dead letters become visible
+        HEALTHY["dlq"] = False
+        s, r = post("/webhook/async-dlq", {}, {"Idempotency-Key": "dlq-2"})
+        await wait_for(lambda: "dead       1" in admin("stats")[1], timeout=8)
+        s, text = scrape()
+        check("metrics: dead-letter counter incremented", metric(text, 'hermes_outbox_dead_lettered_total{endpoint="/webhook/async-dlq",target="dlq"}') == 1, text[:0])
+        check("metrics: outbox gauge shows 1 dead job", metric(text, 'hermes_outbox_jobs{state="dead"}') == 1)
+        HEALTHY["dlq"] = True
+        admin("replay", "--all")
+        DELIVERED = 'hermes_outbox_jobs_delivered_total{endpoint="/webhook/async-dlq",target="dlq"}'
+        await wait_for(lambda: metric(scrape()[1], DELIVERED) == 1, timeout=8)
+        s, text = scrape()
+        check("metrics: after replay the dead gauge returns to 0 and delivery is counted",
+              metric(text, 'hermes_outbox_jobs{state="dead"}') == 0 and metric(text, DELIVERED) == 1,
+              (metric(text, 'hermes_outbox_jobs{state="dead"}'), metric(text, DELIVERED)))
+        check("metrics: oldest-waiting-job gauge exported", metric(text, "hermes_outbox_oldest_waiting_job_age_seconds") is not None)
+
+        # ======================= concurrency limit (second instance) =======================
+        second = subprocess.Popen([os.environ.get("HERMES_BIN", "target/debug/hermes-rs")],
+                                  env=hermes_env(HERMES_PORT="3001", HERMES_MAX_CONCURRENT_REQUESTS="1",
+                                                 HERMES_OUTBOX_PATH="/tmp/hermes-e2e-outbox/second.db"),
+                                  stdout=open("/tmp/hermes-e2e-2.log", "w"), stderr=subprocess.STDOUT)
+        try:
+            for _ in range(100):
+                try: urllib.request.urlopen("http://127.0.0.1:3001/health", timeout=1); break
+                except Exception: time.sleep(0.1)
+            out = []
+            def slow_call(): out.append(http_req("/webhook/slow-sync", b"{}", port=3001))
+            t1 = threading.Thread(target=slow_call); t1.start(); time.sleep(0.4)
+            s2, h2, b2 = http_req("/webhook/slow-sync", b"{}", port=3001)       # arrives while the first is in flight
+            t1.join()
+            check("limit=1: second concurrent request => 503 + Retry-After", s2 == 503 and h2.get("retry-after") == "1", (s2, h2))
+            check("limit=1: the first request still completed normally", out and out[0][0] == 200, out)
+            s3, h3, b3 = http_req("/webhook/slow-sync", b"{}", port=3001)
+            check("limit=1: capacity is released afterwards", s3 == 200, s3)
+        finally:
+            second.terminate(); second.wait(timeout=15)
 
         # 7. resilience: kill RabbitMQ connection from broker side, next publish must reconnect
         for c in json.loads(subprocess.check_output(["rabbitmqctl","list_connections","--formatter","json","name","user"])):

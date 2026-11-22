@@ -12,10 +12,12 @@ pub use error::SinkError;
 pub use retry::RetryPolicy;
 
 use crate::config::{AppSettings, DeliveryPolicy, Target, TargetKind};
+use crate::metrics::Metrics;
 use breaker::{BreakerConfig, Breakers};
 use futures_util::future::join_all;
 use serde::Serialize;
 use serde_json::Value;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::warn;
 
@@ -66,6 +68,13 @@ impl BroadcastReport {
     }
 }
 
+/// Where a delivery belongs; only used to label metrics and logs.
+#[derive(Debug, Clone, Copy)]
+pub struct DeliveryCtx<'a> {
+    pub endpoint: &'a str,
+    pub target: &'a str,
+}
+
 /// Result of a single guarded attempt.
 #[derive(Debug)]
 pub enum Attempt {
@@ -81,6 +90,7 @@ pub struct Dispatcher {
     nats: nats::NatsSink,
     breakers: Breakers,
     default_timeout: Duration,
+    metrics: Arc<Metrics>,
 }
 
 /// What a circuit breaker protects: the *destination*, so every target that
@@ -94,13 +104,14 @@ fn breaker_key(target: &Target) -> String {
 }
 
 impl Dispatcher {
-    pub fn new(default_timeout_secs: u64, settings: &AppSettings) -> Self {
+    pub fn new(default_timeout_secs: u64, settings: &AppSettings, metrics: Arc<Metrics>) -> Self {
         Self {
             http: http::HttpSink::new(default_timeout_secs),
             rabbit: Default::default(),
             nats: Default::default(),
             breakers: Breakers::new(BreakerConfig::from(&settings.circuit_breaker)),
             default_timeout: Duration::from_secs(default_timeout_secs),
+            metrics,
         }
     }
 
@@ -129,23 +140,31 @@ impl Dispatcher {
     /// This is the building block for both the in-process retry loop
     /// ([`Dispatcher::deliver`]) and the outbox workers, which schedule
     /// their retries in the database instead.
-    pub async fn attempt(&self, target: &Target, payload: &Value, message_id: &str) -> Attempt {
+    pub async fn attempt(&self, ctx: DeliveryCtx<'_>, target: &Target, payload: &Value, message_id: &str) -> Attempt {
         let key = breaker_key(target);
+        let kind = target.type_name();
         if let Err(wait) = self.breakers.acquire(&key) {
             let msg = format!(
                 "circuit open for {}: skipped, destination looks down (retry in ~{}s)",
                 target.describe(),
                 wait.as_secs().max(1)
             );
+            self.metrics.record_attempt(ctx.endpoint, ctx.target, kind, "circuit_open", 0.0);
             return Attempt::CircuitOpen { retry_in: wait, error: SinkError::permanent(msg) };
         }
-        match self.send_once(target, payload, message_id).await {
+        let started = Instant::now();
+        let outcome = self.send_once(target, payload, message_id).await;
+        let secs = started.elapsed().as_secs_f64();
+        match outcome {
             Ok(v) => {
                 self.breakers.record(&key, true);
+                self.metrics.record_attempt(ctx.endpoint, ctx.target, kind, "ok", secs);
                 Attempt::Delivered(v)
             }
             Err(e) => {
                 self.breakers.record(&key, e.destination_healthy());
+                let result = if e.retryable { "retryable_error" } else { "permanent_error" };
+                self.metrics.record_attempt(ctx.endpoint, ctx.target, kind, result, secs);
                 Attempt::Failed(e)
             }
         }
@@ -155,6 +174,7 @@ impl Dispatcher {
     /// result and how many attempts were actually made.
     pub async fn deliver(
         &self,
+        ctx: DeliveryCtx<'_>,
         target: &Target,
         payload: &Value,
         message_id: &str,
@@ -166,7 +186,7 @@ impl Dispatcher {
         loop {
             // The breaker is consulted before *every* attempt, so one that
             // opens while we are retrying stops us immediately.
-            let e = match self.attempt(target, payload, message_id).await {
+            let e = match self.attempt(ctx, target, payload, message_id).await {
                 Attempt::Delivered(v) => return (Ok(v), attempts + 1),
                 Attempt::CircuitOpen { error, .. } => return (Err(error), attempts),
                 Attempt::Failed(e) => e,
@@ -199,11 +219,14 @@ impl Dispatcher {
     /// Sends every delivery concurrently and returns outcomes in input order.
     /// A slow or failing target never delays or cancels the others. All
     /// targets, and all retries, share one `message_id`.
-    pub async fn broadcast(&self, message_id: &str, deliveries: Vec<Delivery<'_>>) -> Vec<TargetOutcome> {
+    pub async fn broadcast(&self, endpoint: &str, message_id: &str, deliveries: Vec<Delivery<'_>>) -> Vec<TargetOutcome> {
         join_all(deliveries.into_iter().map(|d| async move {
             let started = Instant::now();
             let (result, attempts) = match d.payload {
-                Ok(payload) => self.deliver(d.target, &payload, message_id, &d.retry).await,
+                Ok(payload) => {
+                    let ctx = DeliveryCtx { endpoint, target: &d.label };
+                    self.deliver(ctx, d.target, &payload, message_id, &d.retry).await
+                }
                 Err(e) => (Err(SinkError::permanent(e)), 0),
             };
             let elapsed_ms = started.elapsed().as_millis() as u64;
