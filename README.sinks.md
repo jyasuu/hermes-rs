@@ -36,6 +36,7 @@ and `targets` can be combined; `target` is delivered first.
   override with `timeout_seconds`).
 * **HTTP targets now count a non-2xx reply as a failed delivery** (previously
   any reply was reported as success).
+* Every response carries a `message_id`, and every result an `attempts` count.
 
 ## Target types
 
@@ -49,6 +50,50 @@ Connections are created lazily, cached per URL, and re-established
 automatically (RabbitMQ: on the next delivery after a failure; NATS: by the
 client). Credentials embedded in URLs are **redacted** from logs and from
 `hermes-admin list-endpoints`.
+
+## Reliability: retries, idempotency, circuit breaker
+
+Delivery is **at-least-once**. Retries can produce duplicates (e.g. a target
+processed the request but its reply timed out), so every delivery carries the
+same **message id**, which consumers can use to discard repeats.
+
+### Retries
+Per target; precedence: `target.retry` > register `retry_config` > `settings`.
+Waits grow exponentially (`delay_ms` × `backoff_multiplier`ⁿ, capped by
+`max_delay_ms`) with jitter. `max_elapsed_ms` (default 15 s) bounds how long the
+webhook caller can be kept waiting. **Defaults: 3 attempts, 1 s first wait.**
+Set `settings.retry_attempts: 1` to disable.
+
+| retried (transient) | not retried (final) |
+|---|---|
+| network error, reset, timeout | HTTP 4xx (except 408, 425, 429), 501 |
+| HTTP 5xx, 408, 425, 429 (`Retry-After` seconds honoured) | RabbitMQ unroutable message |
+| RabbitMQ connect/publish error or nack | RabbitMQ exchange/queue declare error |
+| NATS / JetStream connect, publish or ack error | invalid header / method / template output |
+
+### Idempotency key
+One id per inbound request, shared by all targets and all retries. Taken from
+the first valid header of `Idempotency-Key`, `X-Idempotency-Key`,
+`X-GitHub-Delivery`, `X-Request-Id` (1–128 visible ASCII chars); otherwise a
+random UUID is generated. Sent as:
+
+| target | where |
+|---|---|
+| http | `Idempotency-Key` header (a header set on the target wins) |
+| rabbitmq | AMQP `message_id` property |
+| nats | `Nats-Msg-Id` header — **JetStream drops a repeat inside the stream's duplicate window** (default 2 min). Needs NATS ≥ 2.2 |
+
+Note: a generated id is new for every inbound request, so it protects against
+*Hermes's own* retries. To also collapse the *sender's* redeliveries, the
+sender must supply a stable key (GitHub's `X-GitHub-Delivery` already is).
+
+### Circuit breaker
+Keyed by destination (HTTP URL, or broker URL — all targets on one broker share
+it). After `failure_threshold` consecutive unhealthy attempts the destination is
+skipped instantly (`attempts: 0`, error `circuit open …`) for `cooldown_secs`,
+then a single probe decides whether to close it. Only *unhealthy* outcomes
+count: a 4xx or an unroutable message proves the destination is alive.
+State is per process and in memory.
 
 ## Admin CLI
 

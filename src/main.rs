@@ -1,6 +1,6 @@
 use axum::{
     extract::{Path, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::Json,
     routing::{any, get},
     Router,
@@ -10,7 +10,8 @@ use handlebars::Handlebars;
 use hermes_rs::{
     config::{Args, Config, DeliveryPolicy, Target},
     health,
-    sink::{BroadcastReport, Delivery, Dispatcher},
+    idempotency::resolve_message_id,
+    sink::{BroadcastReport, Delivery, Dispatcher, RetryPolicy},
     template::{json_to_template_data, new_handlebars},
 };
 use serde::Serialize;
@@ -62,6 +63,8 @@ struct CompiledTarget {
     target: Target,
     /// `Some` when the target overrides the register's template.
     own_template: Option<String>,
+    /// Effective retry policy: target > register `retry_config` > `settings`.
+    retry: RetryPolicy,
 }
 
 struct CompiledRegister {
@@ -85,8 +88,15 @@ impl AppState {
     fn new(config: &Config, args: &Args) -> Self {
         let mut hbs = new_handlebars();
         let mut registers = HashMap::new();
+        let global_policy = RetryPolicy::from_settings(&config.settings);
 
         for (i, reg) in config.registers.iter().enumerate() {
+            let register_policy = reg
+                .retry_config
+                .as_ref()
+                .map(RetryPolicy::from_config)
+                .unwrap_or(global_policy);
+
             let default_template = format!("reg{i}");
             hbs.register_template_string(&default_template, &reg.template)
                 .unwrap_or_else(|e| panic!("Failed to register template '{default_template}': {e}"));
@@ -101,7 +111,8 @@ impl AppState {
                             .unwrap_or_else(|e| panic!("Failed to register template '{name}': {e}"));
                         name
                     });
-                    CompiledTarget { label: t.label(j), target: t.clone(), own_template }
+                    let retry = t.retry.as_ref().map(RetryPolicy::from_config).unwrap_or(register_policy);
+                    CompiledTarget { label: t.label(j), target: t.clone(), own_template, retry }
                 })
                 .collect();
 
@@ -114,7 +125,7 @@ impl AppState {
         AppState(Arc::new(Inner {
             registers,
             handlebars: hbs,
-            dispatcher: Dispatcher::new(args.request_timeout),
+            dispatcher: Dispatcher::new(args.request_timeout, &config.settings),
         }))
     }
 }
@@ -143,11 +154,14 @@ fn render_template(
 async fn handle_webhook(
     State(state): State<AppState>,
     Path(path): Path<String>,
+    headers: HeaderMap,
     body: String,
 ) -> ApiResult<(StatusCode, Json<Value>)> {
     let endpoint = format!("/{}", path);
+    // One id for this request: shared by every target and every retry.
+    let message_id = resolve_message_id(&headers);
 
-    info!(endpoint = %endpoint, payload_size = body.len(), "Processing webhook request");
+    info!(endpoint = %endpoint, message_id = %message_id, payload_size = body.len(), "Processing webhook request");
 
     let register = state.0.registers.get(&endpoint).ok_or_else(|| {
         warn!(endpoint = %endpoint, "Webhook endpoint not found");
@@ -177,17 +191,18 @@ async fn handle_webhook(
                 Some(name) => render_template(&state.0.handlebars, name, &template_data),
                 None => default_payload.clone(),
             },
+            retry: t.retry,
         })
         .collect();
 
     let total = deliveries.len();
-    let outcomes = state.0.dispatcher.broadcast(deliveries).await;
+    let outcomes = state.0.dispatcher.broadcast(&message_id, deliveries).await;
     let report = BroadcastReport::new(register.delivery, outcomes);
 
     for r in &report.results {
         match &r.error {
-            None => info!(endpoint = %endpoint, target = %r.target, kind = r.kind, elapsed_ms = r.elapsed_ms, "Delivered"),
-            Some(err) => warn!(endpoint = %endpoint, target = %r.target, kind = r.kind, elapsed_ms = r.elapsed_ms, error = %err, "Delivery failed"),
+            None => info!(endpoint = %endpoint, target = %r.target, kind = r.kind, attempts = r.attempts, elapsed_ms = r.elapsed_ms, "Delivered"),
+            Some(err) => warn!(endpoint = %endpoint, target = %r.target, kind = r.kind, attempts = r.attempts, elapsed_ms = r.elapsed_ms, error = %err, "Delivery failed"),
         }
     }
 
@@ -201,6 +216,7 @@ async fn handle_webhook(
 
     let mut resp = serde_json::json!({
         "status": status_text,
+        "message_id": message_id,
         "delivered": report.ok,
         "total": report.total,
         "results": report.results,

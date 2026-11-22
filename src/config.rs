@@ -54,6 +54,8 @@ pub struct AppSettings {
     pub retry_delay_ms: u64,
     #[serde(default = "default_enable_metrics")]
     pub enable_metrics: bool,
+    #[serde(default)]
+    pub circuit_breaker: CircuitBreakerSettings,
 }
 
 impl Default for AppSettings {
@@ -62,6 +64,32 @@ impl Default for AppSettings {
             retry_attempts: default_retry_attempts(),
             retry_delay_ms: default_retry_delay_ms(),
             enable_metrics: default_enable_metrics(),
+            circuit_breaker: CircuitBreakerSettings::default(),
+        }
+    }
+}
+
+/// Stops hammering a destination that is down. After `failure_threshold`
+/// consecutive *unhealthy* attempts (network error, timeout, 5xx, nack) the
+/// destination is skipped ("circuit open") for `cooldown_secs`; then a single
+/// probe is let through. 4xx replies and unroutable messages mean the
+/// destination is alive and never count as failures.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct CircuitBreakerSettings {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_cb_threshold")]
+    pub failure_threshold: u32,
+    #[serde(default = "default_cb_cooldown")]
+    pub cooldown_secs: u64,
+}
+
+impl Default for CircuitBreakerSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            failure_threshold: default_cb_threshold(),
+            cooldown_secs: default_cb_cooldown(),
         }
     }
 }
@@ -133,6 +161,8 @@ pub struct Target {
     pub name: Option<String>,
     /// Overrides the register's template for this target only.
     pub template: Option<String>,
+    /// Overrides the register's `retry_config` / global `settings` for this target.
+    pub retry: Option<RetryConfig>,
     #[serde(flatten)]
     pub kind: TargetKind,
 }
@@ -220,6 +250,11 @@ impl<'de> Deserialize<'de> for Target {
         let name = take_string("name")?;
         let template = take_string("template")?;
 
+        let retry = match map.remove("retry") {
+            None | Some(Value::Null) => None,
+            Some(v) => Some(serde_yaml::from_value(v).map_err(|e| D::Error::custom(format!("target.retry: {e}")))?),
+        };
+
         let rest = Value::Mapping(map);
         let kind = match kind_name.to_ascii_lowercase().as_str() {
             "http" | "https" => TargetKind::Http(serde_yaml::from_value(rest).map_err(D::Error::custom)?),
@@ -234,7 +269,7 @@ impl<'de> Deserialize<'de> for Target {
             }
         };
 
-        Ok(Target { name, template, kind })
+        Ok(Target { name, template, retry, kind })
     }
 }
 
@@ -290,11 +325,31 @@ pub fn redact_url(raw: &str) -> String {
 // Misc config
 // ---------------------------------------------------------------------------
 
+/// Retry policy for failed deliveries. Only *transient* failures are retried
+/// (network errors, timeouts, HTTP 5xx/408/429, broker nacks); a 4xx reply or
+/// an unroutable message fails immediately.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct RetryConfig {
+    /// Total tries including the first one (`1` = never retry).
+    #[serde(default = "default_retry_attempts")]
     pub attempts: u32,
+    /// Delay before the first retry.
+    #[serde(default = "default_retry_delay_ms")]
     pub delay_ms: u64,
+    /// Each further retry waits this much longer than the previous one.
+    #[serde(default = "default_backoff")]
     pub backoff_multiplier: f64,
+    /// Upper bound for a single wait.
+    #[serde(default = "default_max_delay_ms")]
+    pub max_delay_ms: u64,
+    /// Give up retrying once this much time has passed since the first try
+    /// (bounds how long the webhook caller waits). `null` = no bound.
+    #[serde(default = "default_max_elapsed_ms")]
+    pub max_elapsed_ms: Option<u64>,
+    /// Randomise each wait to between 50% and 100% of its value so many
+    /// failing deliveries don't retry in lock-step.
+    #[serde(default = "default_true")]
+    pub jitter: bool,
 }
 
 fn default_retry_attempts() -> u32 {
@@ -305,6 +360,21 @@ fn default_retry_delay_ms() -> u64 {
 }
 fn default_enable_metrics() -> bool {
     false
+}
+fn default_backoff() -> f64 {
+    2.0
+}
+fn default_max_delay_ms() -> u64 {
+    30_000
+}
+fn default_max_elapsed_ms() -> Option<u64> {
+    Some(15_000)
+}
+fn default_cb_threshold() -> u32 {
+    5
+}
+fn default_cb_cooldown() -> u64 {
+    30
 }
 fn default_http_method() -> String {
     "POST".to_string()
@@ -329,6 +399,23 @@ impl Config {
     pub fn validate(&self) -> Result<(), String> {
         let valid_methods = ["GET", "POST", "PUT", "DELETE", "PATCH"];
         let mut seen = HashSet::new();
+
+        if self.settings.retry_attempts == 0 {
+            return Err("settings.retry_attempts must be >= 1 (1 = no retries)".into());
+        }
+        let cb = &self.settings.circuit_breaker;
+        if cb.enabled && (cb.failure_threshold == 0 || cb.cooldown_secs == 0) {
+            return Err("settings.circuit_breaker: failure_threshold and cooldown_secs must be >= 1".into());
+        }
+        let check_retry = |at: &str, r: &RetryConfig| -> Result<(), String> {
+            if r.attempts == 0 {
+                return Err(format!("{at}: retry.attempts must be >= 1 (1 = no retries)"));
+            }
+            if !(r.backoff_multiplier.is_finite() && r.backoff_multiplier >= 1.0) {
+                return Err(format!("{at}: retry.backoff_multiplier must be >= 1.0"));
+            }
+            Ok(())
+        };
 
         for (i, reg) in self.registers.iter().enumerate() {
             let at = format!("Register {i} ({})", reg.endpoint);
@@ -355,11 +442,17 @@ impl Config {
                     .map_err(|e| format!("{at}: {label} template error: {e}"))
             };
             check_template("register", &reg.template)?;
+            if let Some(r) = &reg.retry_config {
+                check_retry(&at, r)?;
+            }
 
             for (j, t) in targets.iter().enumerate() {
                 let tl = format!("{at}, target '{}'", t.label(j));
                 if let Some(tpl) = &t.template {
                     check_template(&format!("target '{}'", t.label(j)), tpl)?;
+                }
+                if let Some(r) = &t.retry {
+                    check_retry(&tl, r)?;
                 }
                 match &t.kind {
                     TargetKind::Http(h) => {
@@ -529,5 +622,43 @@ registers:
         let r = redact_url("amqp://user:secret@mq.local:5672/%2f");
         assert!(!r.contains("secret") && !r.contains("user"), "{r}");
         assert!(r.contains("mq.local"));
+    }
+
+    #[test]
+    fn retry_config_defaults_and_overrides() {
+        let cfg = parse(
+            r#"
+settings:
+  circuit_breaker: { failure_threshold: 2, cooldown_secs: 7 }
+registers:
+  - endpoint: /w
+    method: POST
+    template: '{}'
+    retry_config: { attempts: 5 }
+    targets:
+      - { url: "http://a", retry: { attempts: 2, delay_ms: 50, backoff_multiplier: 3.0, jitter: false, max_elapsed_ms: null } }
+      - { url: "http://b" }
+"#,
+        );
+        cfg.validate().unwrap();
+        let reg = &cfg.registers[0];
+        let rc = reg.retry_config.as_ref().unwrap();
+        assert_eq!((rc.attempts, rc.delay_ms, rc.max_delay_ms), (5, 1000, 30_000));
+        assert_eq!(rc.max_elapsed_ms, Some(15_000));
+        let t0 = reg.all_targets().next().unwrap().retry.as_ref().unwrap();
+        assert_eq!((t0.attempts, t0.delay_ms, t0.jitter, t0.max_elapsed_ms), (2, 50, false, None));
+        assert!(reg.all_targets().nth(1).unwrap().retry.is_none());
+        assert_eq!(cfg.settings.circuit_breaker.failure_threshold, 2);
+        assert!(cfg.settings.circuit_breaker.enabled);
+    }
+
+    #[test]
+    fn validate_rejects_bad_retry_and_breaker() {
+        let zero = parse("registers:\n  - { endpoint: /w, method: POST, template: '{}', target: { url: 'http://a', retry: { attempts: 0 } } }\n");
+        assert!(zero.validate().unwrap_err().contains("attempts"));
+        let mult = parse("registers:\n  - { endpoint: /w, method: POST, template: '{}', retry_config: { backoff_multiplier: 0.5 }, target: { url: 'http://a' } }\n");
+        assert!(mult.validate().unwrap_err().contains("backoff_multiplier"));
+        let cb = parse("settings: { circuit_breaker: { failure_threshold: 0 } }\nregisters:\n  - { endpoint: /w, method: POST, template: '{}', target: { url: 'http://a' } }\n");
+        assert!(cb.validate().unwrap_err().contains("circuit_breaker"));
     }
 }

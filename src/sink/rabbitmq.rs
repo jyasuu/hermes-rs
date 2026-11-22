@@ -1,5 +1,6 @@
 //! RabbitMQ sink: publisher-confirmed publishes over a cached connection.
 
+use super::error::SinkError;
 use crate::config::RabbitMqTarget;
 use lapin::{
     options::{
@@ -46,22 +47,22 @@ impl RabbitSink {
     /// Returns a confirm-enabled channel, (re)connecting and declaring the
     /// topology lazily. The lock is held while connecting so two targets that
     /// share a URL never open two connections.
-    async fn channel(&self, t: &RabbitMqTarget) -> Result<Channel, String> {
+    async fn channel(&self, t: &RabbitMqTarget) -> Result<Channel, SinkError> {
         let mut sessions = self.sessions.lock().await;
 
         if !sessions.get(&t.url).map(Session::healthy).unwrap_or(false) {
             sessions.remove(&t.url);
             let conn = Connection::connect(&t.url, ConnectionProperties::default())
                 .await
-                .map_err(|e| format!("RabbitMQ connect failed: {e}"))?;
+                .map_err(|e| SinkError::retryable(format!("RabbitMQ connect failed: {e}")))?;
             let channel = conn
                 .create_channel()
                 .await
-                .map_err(|e| format!("RabbitMQ create_channel failed: {e}"))?;
+                .map_err(|e| SinkError::retryable(format!("RabbitMQ create_channel failed: {e}")))?;
             channel
                 .confirm_select(ConfirmSelectOptions::default())
                 .await
-                .map_err(|e| format!("RabbitMQ confirm_select failed: {e}"))?;
+                .map_err(|e| SinkError::retryable(format!("RabbitMQ confirm_select failed: {e}")))?;
             sessions.insert(
                 t.url.clone(),
                 Session { conn, channel, declared: HashSet::new() },
@@ -82,7 +83,7 @@ impl RabbitSink {
                         FieldTable::default(),
                     )
                     .await
-                    .map_err(|e| format!("exchange_declare '{}' failed: {e}", t.exchange))?;
+                    .map_err(|e| SinkError::permanent(format!("exchange_declare '{}' failed: {e}", t.exchange)))?;
                 session.declared.insert(key);
             }
         }
@@ -98,7 +99,7 @@ impl RabbitSink {
                         FieldTable::default(),
                     )
                     .await
-                    .map_err(|e| format!("queue_declare '{queue}' failed: {e}"))?;
+                    .map_err(|e| SinkError::permanent(format!("queue_declare '{queue}' failed: {e}")))?;
                 if !t.exchange.is_empty() {
                     session
                         .channel
@@ -110,7 +111,7 @@ impl RabbitSink {
                             FieldTable::default(),
                         )
                         .await
-                        .map_err(|e| format!("queue_bind '{queue}' failed: {e}"))?;
+                        .map_err(|e| SinkError::permanent(format!("queue_bind '{queue}' failed: {e}")))?;
                 }
                 session.declared.insert(key);
             }
@@ -123,11 +124,14 @@ impl RabbitSink {
         self.sessions.lock().await.remove(url);
     }
 
-    pub async fn send(&self, t: &RabbitMqTarget, payload: &Value) -> Result<Value, String> {
+    pub async fn send(&self, t: &RabbitMqTarget, payload: &Value, message_id: &str) -> Result<Value, SinkError> {
         let channel = self.channel(t).await?;
-        let body = serde_json::to_vec(payload).map_err(|e| format!("Serialize payload: {e}"))?;
+        let body = serde_json::to_vec(payload)
+            .map_err(|e| SinkError::permanent(format!("Serialize payload: {e}")))?;
 
+        // `message_id` is the standard AMQP property consumers dedupe on.
         let mut props = BasicProperties::default()
+            .with_message_id(message_id.into())
             .with_content_type("application/json".into())
             .with_delivery_mode(if t.persistent { 2 } else { 1 });
         if !t.headers.is_empty() {
@@ -157,16 +161,17 @@ impl RabbitSink {
             Ok(Confirmation::Ack(None)) | Ok(Confirmation::NotRequested) => {
                 Ok(json!({ "confirmed": true }))
             }
-            Ok(Confirmation::Ack(Some(_))) => Err(format!(
+            // The broker is alive and answered; retrying cannot fix a missing binding.
+            Ok(Confirmation::Ack(Some(_))) => Err(SinkError::permanent(format!(
                 "message unroutable: no queue bound to exchange '{}' with key '{}'",
                 t.exchange, t.routing_key
-            )),
-            Ok(Confirmation::Nack(_)) => Err("broker nacked the message".to_string()),
+            ))),
+            Ok(Confirmation::Nack(_)) => Err(SinkError::retryable("broker nacked the message")),
             Err(e) => {
                 // The channel/connection is probably dead; drop it so the next
                 // delivery reconnects instead of failing forever.
                 self.evict(&t.url).await;
-                Err(format!("RabbitMQ publish failed: {e}"))
+                Err(SinkError::retryable(format!("RabbitMQ publish failed: {e}")))
             }
         }
     }

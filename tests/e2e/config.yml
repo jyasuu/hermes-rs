@@ -1,3 +1,8 @@
+# Old scenarios: no retries. New retry/breaker scenarios set their own policy.
+settings:
+  retry_attempts: 1
+  circuit_breaker: { failure_threshold: 4, cooldown_secs: 3 }
+
 registers:
   # Legacy syntax, no `type:` — must behave exactly as before
   - endpoint: /webhook/legacy
@@ -62,3 +67,46 @@ registers:
       exchange: hermes.nowhere
       exchange_type: direct
       routing_key: nothing
+
+  # --- reliability scenarios (served by the test's own HTTP server) ---
+  # 500, 500, then 200  => 3 attempts, same Idempotency-Key each time
+  - endpoint: /webhook/flaky
+    method: POST
+    template: '{"n": 1}'
+    retry_config: { attempts: 4, delay_ms: 100, backoff_multiplier: 2.0, jitter: false }
+    target: { url: "http://127.0.0.1:3999/flaky" }
+
+  # 400 is final: must NOT be retried
+  - endpoint: /webhook/permanent
+    method: POST
+    template: '{"n": 1}'
+    retry_config: { attempts: 4, delay_ms: 50 }
+    target: { url: "http://127.0.0.1:3999/perm" }
+
+  # 429 + Retry-After: 1 => waits >= 1s even though delay_ms is 50
+  - endpoint: /webhook/ratelimited
+    method: POST
+    template: '{"n": 1}'
+    retry_config: { attempts: 3, delay_ms: 50, jitter: false }
+    target: { url: "http://127.0.0.1:3999/rl" }
+
+  # connection refused, 400ms apart, but only ~1s of retry budget
+  - endpoint: /webhook/budget
+    method: POST
+    template: '{"n": 1}'
+    retry_config: { attempts: 10, delay_ms: 400, backoff_multiplier: 1.0, jitter: false, max_elapsed_ms: 1000 }
+    target: { url: "http://127.0.0.1:9/budget" }
+
+  # per-target retry beats register retry_config
+  - endpoint: /webhook/override
+    method: POST
+    template: '{"n": 1}'
+    retry_config: { attempts: 5, delay_ms: 10 }
+    target: { url: "http://127.0.0.1:3999/always500", retry: { attempts: 2, delay_ms: 10 } }
+
+  # nothing listens on :3998 at first => breaker opens; later the server appears
+  - endpoint: /webhook/breaker
+    method: POST
+    template: '{"n": 1}'
+    retry_config: { attempts: 1 }
+    target: { url: "http://127.0.0.1:3998/ping" }
