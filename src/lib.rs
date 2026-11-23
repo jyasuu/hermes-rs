@@ -6,6 +6,7 @@ pub mod idempotency;
 pub mod metrics;
 pub mod outbox;
 pub mod registry;
+pub mod reload;
 pub mod sink;
 pub mod template;
 

@@ -7,6 +7,7 @@ use crate::sink::RetryPolicy;
 use crate::template::new_handlebars;
 use handlebars::Handlebars;
 use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
 
 pub struct CompiledTarget {
     pub label: String,
@@ -36,7 +37,13 @@ pub struct Registry {
 
 impl Registry {
     /// Compiles every template up front. `Config::validate` must have run.
+    /// Panics on a template error; use [`Registry::try_build`] where a failure
+    /// must not take the process down (config reload).
     pub fn build(config: &Config) -> Self {
+        Self::try_build(config).unwrap_or_else(|e| panic!("{e}"))
+    }
+
+    pub fn try_build(config: &Config) -> Result<Self, String> {
         let mut hbs = new_handlebars();
         let mut registers = HashMap::new();
         let sync_default = RetryPolicy::from_settings(&config.settings);
@@ -47,28 +54,28 @@ impl Registry {
 
             let default_template = format!("reg{i}");
             hbs.register_template_string(&default_template, &reg.template)
-                .unwrap_or_else(|e| panic!("Failed to register template '{default_template}': {e}"));
+                .map_err(|e| format!("{}: template error: {e}", reg.endpoint))?;
 
-            let targets = reg
-                .all_targets()
-                .enumerate()
-                .map(|(j, t)| {
-                    let own_template = t.template.as_ref().map(|tpl| {
+            let mut targets = Vec::new();
+            for (j, t) in reg.all_targets().enumerate() {
+                let own_template = match &t.template {
+                    Some(tpl) => {
                         let name = format!("reg{i}_t{j}");
                         hbs.register_template_string(&name, tpl)
-                            .unwrap_or_else(|e| panic!("Failed to register template '{name}': {e}"));
-                        name
-                    });
-                    let own = t.retry.as_ref().map(RetryPolicy::from_config);
-                    CompiledTarget {
-                        label: t.label(j),
-                        target: t.clone(),
-                        own_template,
-                        retry: own.or(reg_policy).unwrap_or(sync_default),
-                        async_retry: own.or(reg_policy).unwrap_or(async_default),
+                            .map_err(|e| format!("{}: target '{}' template error: {e}", reg.endpoint, t.label(j)))?;
+                        Some(name)
                     }
-                })
-                .collect();
+                    None => None,
+                };
+                let own = t.retry.as_ref().map(RetryPolicy::from_config);
+                targets.push(CompiledTarget {
+                    label: t.label(j),
+                    target: t.clone(),
+                    own_template,
+                    retry: own.or(reg_policy).unwrap_or(sync_default),
+                    async_retry: own.or(reg_policy).unwrap_or(async_default),
+                });
+            }
 
             registers.insert(
                 reg.endpoint.clone(),
@@ -83,7 +90,30 @@ impl Registry {
             );
         }
 
-        Registry { registers, handlebars: hbs }
+        Ok(Registry { registers, handlebars: hbs })
+    }
+}
+
+/// The live registry, replaceable at runtime (config reload).
+///
+/// Readers take a cheap snapshot ([`SharedRegistry::current`]) and keep using
+/// it for the whole request, so a reload can never change the rules halfway
+/// through a request, and requests in flight are never interrupted.
+pub struct SharedRegistry {
+    inner: RwLock<Arc<Registry>>,
+}
+
+impl SharedRegistry {
+    pub fn new(registry: Registry) -> Self {
+        Self { inner: RwLock::new(Arc::new(registry)) }
+    }
+
+    pub fn current(&self) -> Arc<Registry> {
+        self.inner.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    pub fn replace(&self, registry: Registry) {
+        *self.inner.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(registry);
     }
 }
 
@@ -126,5 +156,26 @@ registers:
         assert_eq!((t[1].retry.attempts, t[1].async_retry.attempts), (2, 2), "target beats register");
         assert_eq!(t[1].retry.base_delay, Duration::from_millis(77));
         assert_eq!(r.registers["/plain"].mode, DispatchMode::Async);
+    }
+
+    #[test]
+    fn shared_registry_snapshots_are_stable_across_a_replace() {
+        let cfg = |ep: &str| {
+            Config::from_yaml(&format!("registers:\n  - {{ endpoint: {ep}, method: POST, template: '{{}}', target: {{ url: 'http://a' }} }}\n")).unwrap()
+        };
+        let shared = SharedRegistry::new(Registry::build(&cfg("/old")));
+        let in_flight = shared.current();
+        shared.replace(Registry::build(&cfg("/new")));
+        assert!(in_flight.registers.contains_key("/old"), "a request already running keeps its snapshot");
+        assert!(!in_flight.registers.contains_key("/new"));
+        let after = shared.current();
+        assert!(after.registers.contains_key("/new") && !after.registers.contains_key("/old"));
+    }
+
+    #[test]
+    fn try_build_reports_template_errors_instead_of_panicking() {
+        let cfg = Config::from_yaml("registers:\n  - { endpoint: /w, method: POST, template: '{{#if}}', target: { url: 'http://a' } }\n").unwrap();
+        let err = Registry::try_build(&cfg).err().expect("must fail");
+        assert!(err.contains("/w") && err.contains("template"), "{err}");
     }
 }

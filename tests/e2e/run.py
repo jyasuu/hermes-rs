@@ -1,4 +1,4 @@
-import asyncio, hashlib, hmac as _hmac, base64, json, subprocess, time, urllib.request, urllib.error, os, sys, threading
+import asyncio, hashlib, hmac as _hmac, base64, json, shutil, signal, subprocess, time, urllib.request, urllib.error, os, sys, threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import nats, pika
 
@@ -42,12 +42,15 @@ def serve(port):
     return srv
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
-CFG = os.path.join(ROOT, "config.yml")
+SRC_CFG = os.path.join(ROOT, "config.yml")
+WORK = "/tmp/hermes-e2e-config"          # Hermes runs from a COPY so the test can edit it
+CFG = os.path.join(WORK, "config.yml")
+ROT_FILE = os.path.join(WORK, "rot_secret")
 OUTBOX = "/tmp/hermes-e2e-outbox/outbox.db"
 HERMES = {"p": None}
 def hermes_env(**extra):
     env = dict(os.environ, HERMES_CONFIG_PATH=CFG, HERMES_LOG_FORMAT="json", HERMES_LOG_LEVEL="info",
-               HERMES_OUTBOX_PATH=OUTBOX, E2E_METRICS_TOKEN="metrics-tok", E2E_SHOPIFY_SECRET="shop-secret")
+               HERMES_OUTBOX_PATH=OUTBOX, E2E_METRICS_TOKEN="metrics-tok", E2E_SHOPIFY_SECRET="shop-secret", E2E_ROT_SECRET_FILE=ROT_FILE)
     env.update(extra)
     return env
 
@@ -59,6 +62,26 @@ def http_req(path, data=None, headers=None, method="POST", port=3000):
 
 def hex_sig(secret, body): return "sha256=" + _hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
 def b64_sig(secret, body): return base64.b64encode(_hmac.new(secret.encode(), body, hashlib.sha256).digest()).decode()
+
+def stripe_header(secret, t, body):
+    sig = _hmac.new(secret.encode(), f"{t}.".encode() + body, hashlib.sha256).hexdigest()
+    return f"t={t},v1={sig}"
+def slack_headers(secret, ts, body):
+    sig = _hmac.new(secret.encode(), f"v0:{ts}:".encode() + body, hashlib.sha256).hexdigest()
+    return {"X-Slack-Signature": "v0=" + sig, "X-Slack-Request-Timestamp": str(ts)}
+
+def cfg_text(): return open(CFG).read()
+def write_cfg(t): open(CFG, "w").write(t)
+def reload_counts():
+    s, text = scrape()
+    return (metric(text, 'hermes_config_reloads_total{result="success"}') or 0, metric(text, 'hermes_config_reloads_total{result="failure"}') or 0)
+async def do_reload():
+    """SIGHUP, wait until Hermes has finished handling it. True = applied, False = rejected."""
+    before = reload_counts()
+    os.kill(HERMES["p"].pid, signal.SIGHUP)
+    done = await wait_for(lambda: reload_counts() != before, timeout=6)
+    after = reload_counts()
+    return bool(done and after[0] > before[0])
 
 def metric(text, series):
     """Value of an exact series line, e.g. 'hermes_x_total{a="b"}', or None."""
@@ -94,6 +117,9 @@ def check(name, cond, extra=""):
     results.append(cond); print(("PASS " if cond else "FAIL ") + name + (f"  [{extra}]" if extra and not cond else ""))
 
 async def main():
+    os.makedirs(WORK, exist_ok=True)
+    shutil.copy(SRC_CFG, CFG)
+    open(ROT_FILE, "w").write("rot-1\n")
     for suffix in ("", "-wal", "-shm"):
         try: os.remove(OUTBOX + suffix)
         except FileNotFoundError: pass
@@ -441,6 +467,138 @@ async def main():
             check("limit=1: capacity is released afterwards", s3 == 200, s3)
         finally:
             second.terminate(); second.wait(timeout=15)
+
+
+        # ================= timestamped signatures: replay protection =================
+        N1 = COUNTS.get("/auth-ok", 0)
+        sbody = b'{"id": "evt_1", "type": "invoice.paid"}'
+        now = int(time.time())
+        s, h, b = http_req("/webhook/stripe-in", sbody, {"Stripe-Signature": stripe_header("whsec_e2e", now, sbody)})
+        check("stripe: fresh valid signature => 200", s == 200, (s, b))
+        s, h, b = http_req("/webhook/stripe-in", sbody, {"Stripe-Signature": stripe_header("whsec_e2e", now - 1000, sbody)})
+        check("stripe: genuine signature but 1000s old (replay) => 401", s == 401, (s, b))
+        s, h, b = http_req("/webhook/stripe-in", sbody, {"Stripe-Signature": stripe_header("whsec_e2e", now + 1000, sbody)})
+        check("stripe: timestamp from the future => 401", s == 401, (s, b))
+        s, h, b = http_req("/webhook/stripe-in", sbody, {"Stripe-Signature": stripe_header("not-the-secret", now, sbody)})
+        check("stripe: wrong secret => 401", s == 401, (s, b))
+        old = stripe_header("whsec_e2e", now - 1000, sbody).split("v1=")[1]
+        s, h, b = http_req("/webhook/stripe-in", sbody, {"Stripe-Signature": f"t={now},v1={old}"})
+        check("stripe: replay with a rewritten timestamp => 401", s == 401, (s, b))
+        good = stripe_header("whsec_e2e", now, sbody).split("v1=")[1]
+        s, h, b = http_req("/webhook/stripe-in", sbody, {"Stripe-Signature": f"t={now},v1={'0'*64},v1={good}"})
+        check("stripe: several v1 (secret rotation), one valid => 200", s == 200, (s, b))
+        s, h, b = http_req("/webhook/stripe-in", sbody, {"Stripe-Signature": "garbage"})
+        check("stripe: malformed header => 401", s == 401, (s, b))
+
+        slbody = b'{"type": "event_callback", "team_id": "T1", "event": {"type": "message", "text": "hello"}}'
+        s, h, b = http_req("/webhook/slack-in", slbody, slack_headers("slack_e2e", now, slbody))
+        check("slack: fresh valid signature => 200", s == 200, (s, b))
+        s, h, b = http_req("/webhook/slack-in", slbody, slack_headers("slack_e2e", now - 1000, slbody))
+        check("slack: genuine signature but stale timestamp => 401", s == 401, (s, b))
+        s, h, b = http_req("/webhook/slack-in", b'{"type": "event_callback", "team_id": "T1", "event": {"type": "message", "text": "HELLO"}}', slack_headers("slack_e2e", now, slbody))
+        check("slack: tampered body => 401", s == 401, (s, b))
+        check("timestamped auth: only the 3 valid requests reached the target", COUNTS.get("/auth-ok") == N1 + 3, (COUNTS.get("/auth-ok"), N1))
+
+        # ============================== hot config reload ==============================
+        statuses = []; stop = threading.Event()
+        def load():
+            payload = json.dumps({"message": "steady traffic"}).encode()
+            while not stop.is_set():
+                try: statuses.append(http_req("/webhook/legacy", payload)[0])
+                except Exception as e: statuses.append(f"error:{type(e).__name__}")
+                time.sleep(0.002)
+        loaders = [threading.Thread(target=load, daemon=True) for _ in range(4)]
+        for t in loaders: t.start()
+
+        # -- add an endpoint without restarting --
+        s, h, b = http_req("/webhook/reload-new", b'{"x":1}')
+        check("reload: endpoint does not exist yet => 404", s == 404, s)
+        NEW_REG = """
+  - endpoint: /webhook/reload-new
+    method: POST
+    template: '{"v": 1}'
+    target: { url: "http://127.0.0.1:3999/auth-ok" }
+"""
+        write_cfg(cfg_text() + NEW_REG)
+        check("reload: SIGHUP applies a valid edit", await do_reload())
+        s, h, b = http_req("/webhook/reload-new", b'{"x":1}')
+        check("reload: the new endpoint is live immediately (200)", s == 200, (s, b))
+
+        # -- rotate a secret that lives in the file --
+        body = b'{"action": "rotate"}'
+        s, h, b = http_req("/webhook/auth-github", body, {"X-Hub-Signature-256": hex_sig("gh-secret", body)})
+        check("reload: old secret works before rotation", s == 200, s)
+        write_cfg(cfg_text().replace('"gh-secret"', '"gh-secret-2"'))
+        check("reload: secret rotation applied", await do_reload())
+        s, h, b = http_req("/webhook/auth-github", body, {"X-Hub-Signature-256": hex_sig("gh-secret", body)})
+        check("reload: OLD secret is rejected after rotation (401)", s == 401, s)
+        s, h, b = http_req("/webhook/auth-github", body, {"X-Hub-Signature-256": hex_sig("gh-secret-2", body)})
+        check("reload: NEW secret accepted (200)", s == 200, s)
+
+        # -- rotate a secret supplied through ${VAR}_FILE (Docker/K8s secrets style) --
+        s, h, b = http_req("/webhook/auth-rot", body, {"X-Hub-Signature-256": hex_sig("rot-1", body)})
+        check("reload: secret from E2E_ROT_SECRET_FILE works at startup", s == 200, s)
+        open(ROT_FILE, "w").write("rot-2\n")
+        check("reload: file-based secret rotation applied (config text unchanged)", await do_reload())
+        s1, _, _ = http_req("/webhook/auth-rot", body, {"X-Hub-Signature-256": hex_sig("rot-1", body)})
+        s2, _, _ = http_req("/webhook/auth-rot", body, {"X-Hub-Signature-256": hex_sig("rot-2", body)})
+        check("reload: rotated file secret takes effect (old 401, new 200)", (s1, s2) == (401, 200), (s1, s2))
+
+        # -- a broken edit must change NOTHING --
+        good_cfg = cfg_text()
+        write_cfg(good_cfg + """
+  - endpoint: /webhook/broken
+    method: POST
+    template: '{{#if}}'
+    target: { url: "http://127.0.0.1:3999/auth-ok" }
+""")
+        ok = await do_reload()
+        check("reload: invalid config is REJECTED", ok is False)
+        s, h, b = http_req("/webhook/reload-new", b'{"x":1}')
+        check("reload: previous config keeps serving after a rejected reload", s == 200, s)
+        s, h, b = http_req("/webhook/broken", b'{"x":1}')
+        check("reload: nothing from the rejected file leaked in (404)", s == 404, s)
+        sc, text = scrape()
+        check("reload: failure counted in metrics", metric(text, 'hermes_config_reloads_total{result="failure"}') == 1, "")
+        write_cfg("registers: [")
+        check("reload: unparsable YAML is rejected too", (await do_reload()) is False)
+        write_cfg(good_cfg)
+        check("reload: fixing the file and reloading recovers", await do_reload())
+
+        # -- restart-only setting: applied elsewhere, flagged here --
+        write_cfg(cfg_text().replace("workers: 2", "workers: 3", 1))
+        check("reload: a restart-only change still reloads the rest", await do_reload())
+        log = open("/tmp/hermes-e2e.log").read()
+        check("reload: restart-required settings are called out in the log", "need a restart" in log and "outbox.workers" in log)
+        write_cfg(good_cfg)
+        await do_reload()
+
+        # -- queued async jobs whose target disappears are detected --
+        s, h, b = http_req("/webhook/async-orphan", b'{}', {"Idempotency-Key": "orphan-1"})
+        check("reload: async job queued towards a down target", s == 202, (s, b))
+        write_cfg(cfg_text().replace("name: ghost,", "name: ghost2,"))
+        check("reload: renaming that target reloads", await do_reload())
+        log = open("/tmp/hermes-e2e.log").read()
+        check("reload: orphaned queued jobs are warned about BEFORE they die", "Queued async jobs refer to targets that no longer exist" in log and "ghost" in log)
+        ok = await wait_for(lambda: "dead       1" in admin("stats")[1], timeout=8)
+        rc, out = admin("list", "--state", "dead")
+        check("reload: orphaned job is dead-lettered (not sent anywhere wrong) and replayable", ok and "no longer in the" in out and "ghost" in out, out)
+        admin("purge", "--all")
+        write_cfg(good_cfg)
+        await do_reload()
+
+        # -- remove an endpoint --
+        write_cfg(good_cfg.replace(NEW_REG, ""))
+        check("reload: endpoint removal applied", await do_reload())
+        s, h, b = http_req("/webhook/reload-new", b'{"x":1}')
+        check("reload: removed endpoint is gone (404)", s == 404, s)
+
+        stop.set()
+        for t in loaders: t.join(timeout=5)
+        bad = [x for x in statuses if x != 200]
+        check(f"reload: ZERO failed requests across {len(statuses)} requests during the reloads", len(statuses) > 200 and not bad, (len(statuses), bad[:5]))
+        sc, text = scrape()
+        check("reload: success counter and timestamp exported", (metric(text, 'hermes_config_reloads_total{result="success"}') or 0) >= 8 and (metric(text, "hermes_config_last_success_timestamp_seconds") or 0) > 1.7e9)
 
         # 7. resilience: kill RabbitMQ connection from broker side, next publish must reconnect
         for c in json.loads(subprocess.check_output(["rabbitmqctl","list_connections","--formatter","json","name","user"])):

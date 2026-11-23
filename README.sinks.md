@@ -170,6 +170,10 @@ in async mode, fill the outbox). Add it per register:
   auth: { type: bearer, token: "${GITLAB_TOKEN}", header: X-Gitlab-Token }       # raw token in a custom header
 - endpoint: /webhook/internal
   auth: { type: bearer, token: "${RELAY_TOKEN}" }                                # Authorization: Bearer <token>
+- endpoint: /webhook/stripe
+  auth: { type: stripe, secret: "${STRIPE_WEBHOOK_SECRET}" }                     # Stripe-Signature: t=…,v1=…  (replay-protected)
+- endpoint: /webhook/slack
+  auth: { type: slack, secret: "${SLACK_SIGNING_SECRET}" }                       # X-Slack-Signature + X-Slack-Request-Timestamp (replay-protected)
 ```
 
 * The HMAC is computed over the **exact raw request body**; hex/base64 and the
@@ -178,9 +182,19 @@ in async mode, fill the outbox). Add it per register:
   malformed or wrong credential, any scheme — returns the same
   `401 {"error":"Unauthorized"}`; the reason is only written to the server log
   (never the credential). Comparisons are constant-time.
-* A body-only HMAC can be **replayed** by someone who captured a valid request.
-  Async registers with a stable sender key (`X-GitHub-Delivery`, `Idempotency-Key`)
-  discard replays within `outbox.delivered_retention_secs`; sync registers do not.
+* **Replay protection.** `type: stripe` and `type: slack` also check the
+  signed timestamp and reject anything older (or newer) than `tolerance_secs`
+  (default 300), so a captured request cannot be replayed later. Inside that
+  window a replay is still possible. A plain `hmac`/`bearer` has no timestamp, so
+  a captured request can be **replayed indefinitely**; async registers with a
+  stable sender key (`X-GitHub-Delivery`, `Idempotency-Key`) at least discard
+  repeats within `outbox.delivered_retention_secs`, sync registers do not.
+  In the log, a genuine signature with a bad timestamp is reported as
+  *"timestamp outside tolerance (replay or clock skew)"*, a forgery as
+  *"does not match"*; the caller always sees the same `401`.
+* Bodies must be **JSON**. Slack *Events API* and Stripe send JSON; Slack
+  *slash commands/interactivity* and some others send form-encoded bodies,
+  which Hermes rejects with `400` (after authentication).
 * `hermes-admin list-endpoints` marks unauthenticated endpoints `OPEN`.
 
 ### Secrets from the environment
@@ -190,6 +204,11 @@ URLs, target header values and `settings.metrics_token`** — so credentials
 default **stops startup** with a message naming it. `$$` is a literal `$`.
 Payload **templates are never expanded**. Note `hermes-admin validate-config`
 needs the same variables set.
+
+**Rotatable secrets:** if `VAR` is unset or empty, Hermes reads the file named by
+`VAR_FILE` (the Docker/Kubernetes secrets convention; trailing newline trimmed).
+The file is re-read on every config reload, so you can rotate a secret by
+updating the file and sending `SIGHUP` — no restart.
 
 ## Metrics & alerting
 
@@ -206,14 +225,49 @@ configuration, never from request data, so scanners cannot create new series.
 | `hermes_outbox_oldest_waiting_job_age_seconds` | backlog age; grows during an outage |
 | `hermes_outbox_dead_lettered_total{endpoint,target}` | **alert on this** |
 | `hermes_outbox_jobs_delivered_total{endpoint,target}` | async successes |
+| `hermes_config_reloads_total{result}` | SIGHUP reloads, `success` / `failure` |
+| `hermes_config_last_success_timestamp_seconds` | when the running config was loaded |
 
 Counters live in memory and reset on restart (Prometheus handles that);
 the `hermes_outbox_jobs` gauges come from the database and survive restarts.
 
 `alerts.yml` ships rules for: Hermes down, dead letters, dead-letter backlog,
-outbox backlog, delivery-failure ratio, auth-rejection bursts and load shedding.
+outbox backlog, delivery-failure ratio, auth-rejection bursts, load shedding and
+rejected config reloads.
 They are covered by `promtool test rules tests/alerts/alerts_test.yml`.
 The bundled `prometheus.yml` / compose file already load them.
+
+## Hot config reload
+
+```bash
+hermes-admin validate-config -c config.yml     # check the edit first
+kill -HUP $(pidof hermes-rs)                   # docker: docker kill -s HUP <container>
+```
+
+* **Atomic and safe.** The file is loaded, validated and fully compiled *before*
+  anything changes. A bad edit (YAML error, broken template, duplicate endpoint,
+  bad auth block…) is rejected, logged as `Configuration reload FAILED`, counted
+  in `hermes_config_reloads_total{result="failure"}`, and Hermes **keeps serving
+  the previous configuration**. The same alert rule (`HermesConfigReloadFailed`)
+  tells you, because nothing else visibly breaks.
+* **No dropped requests.** Each request uses one snapshot of the configuration;
+  a reload swaps the pointer, so requests in flight finish on the rules they
+  started with. (e2e: 548 requests across 9 reloads, 0 failures.)
+* **Reloadable:** endpoints, methods, templates, targets, `auth` (incl. rotated
+  secrets), `mode`, `delivery`, `retry_config`, `settings.retry_*`, `outbox.retry`.
+* **Needs a restart** (flagged in the log on every reload until you do):
+  `settings.enable_metrics`, `settings.metrics_token`, `settings.circuit_breaker`,
+  `outbox.path/workers/lease_secs/poll_interval_ms/max_pending/*_retention_secs`,
+  and CLI/env options (`HERMES_PORT`, timeouts, limits…). Turning on the first
+  `mode: async` register also needs a restart (the outbox isn't running); such
+  a reload is rejected with an explanatory message.
+* **Queued async jobs** point at their target by position and label. If an edit
+  removes or renames a target (or shifts the position of one with an unnamed
+  default label), Hermes **warns before** those jobs are dead-lettered. They are
+  never sent to the wrong target, and can be replayed once the target is back.
+  **Give targets of async registers an explicit `name:`** so reordering is safe.
+* Environment variables cannot change in a running process; use `VAR_FILE` for
+  secrets you want to rotate.
 
 ## Request limits & strictness
 * `HERMES_MAX_CONCURRENT_REQUESTS` (default 1000) is now enforced: beyond it

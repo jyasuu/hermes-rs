@@ -16,7 +16,8 @@ use hermes_rs::{
         worker::{self, WorkerContext},
         Enqueued, NewJob, Outbox,
     },
-    registry::{CompiledRegister, Registry},
+    registry::{CompiledRegister, Registry, SharedRegistry},
+    reload,
     sink::{BroadcastReport, Delivery, Dispatcher},
     template::{json_to_template_data, render_template},
 };
@@ -58,7 +59,8 @@ type ApiResult<T> = Result<T, (StatusCode, Json<ErrorResponse>)>;
 // ---------------------------------------------------------------------------
 
 struct Inner {
-    registry: Arc<Registry>,
+    /// Swapped on SIGHUP; handlers take a snapshot per request.
+    registry: Arc<SharedRegistry>,
     dispatcher: Arc<Dispatcher>,
     /// Present when at least one register uses `mode: async`.
     outbox: Option<Outbox>,
@@ -93,12 +95,15 @@ async fn handle_webhook(
     body: String,
 ) -> Response {
     let endpoint = format!("/{}", path);
+    // One snapshot for the whole request: a config reload can never change the
+    // rules halfway through, and never interrupts a request in flight.
+    let registry = state.0.registry.current();
     // Only configured endpoints become metric labels, so scanners can't
     // inflate the number of time series.
-    let label = if state.0.registry.registers.contains_key(&endpoint) { endpoint.as_str() } else { "unknown" };
+    let label = if registry.registers.contains_key(&endpoint) { endpoint.as_str() } else { "unknown" };
 
     let (response, outcome) = match state.0.limiter.try_acquire() {
-        Ok(_permit) => process_webhook(&state, &method, &endpoint, &headers, body).await,
+        Ok(_permit) => process_webhook(&state, &registry, &method, &endpoint, &headers, body).await,
         Err(_) => {
             warn!(endpoint = %endpoint, "Too many concurrent requests, shedding load");
             let (mut r, o) = reject(StatusCode::SERVICE_UNAVAILABLE, "overloaded", "Server is busy, retry later");
@@ -112,12 +117,13 @@ async fn handle_webhook(
 
 async fn process_webhook(
     state: &AppState,
+    registry: &Registry,
     method: &Method,
     endpoint: &str,
     headers: &HeaderMap,
     body: String,
 ) -> Outcome {
-    let Some(register) = state.0.registry.registers.get(endpoint) else {
+    let Some(register) = registry.registers.get(endpoint) else {
         warn!(endpoint = %endpoint, "Webhook endpoint not found");
         return reject(StatusCode::NOT_FOUND, "not_found", "Endpoint not found");
     };
@@ -151,7 +157,7 @@ async fn process_webhook(
         Err(e) => return reject(StatusCode::BAD_REQUEST, "bad_request", &format!("Invalid JSON: {e}")),
     };
     let template_data = json_to_template_data(&request_data);
-    let hbs = &state.0.registry.handlebars;
+    let hbs = &registry.handlebars;
 
     // Render the register-level template once and share it between all
     // targets that don't bring their own.
@@ -394,6 +400,69 @@ fn build_router(state: AppState, args: &Args, enable_metrics: bool) -> Router {
 }
 
 // ---------------------------------------------------------------------------
+// Hot reload
+// ---------------------------------------------------------------------------
+
+/// Waits for SIGHUP and reloads the configuration file. A failed reload is
+/// logged and counted but leaves the running configuration untouched.
+#[cfg(unix)]
+fn spawn_reload_task(
+    path: std::path::PathBuf,
+    mut running: Config,
+    registry: Arc<SharedRegistry>,
+    outbox: Option<Outbox>,
+    metrics: Arc<Metrics>,
+    mut shutdown: watch::Receiver<bool>,
+) -> tokio::task::JoinHandle<()> {
+    use tokio::signal::unix::{signal, SignalKind};
+
+    tokio::spawn(async move {
+        let mut hup = match signal(SignalKind::hangup()) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(error = %e, "Could not install the SIGHUP handler; config reload is unavailable");
+                return;
+            }
+        };
+        info!("Send SIGHUP to reload {}", path.display());
+
+        while !*shutdown.borrow() {
+            tokio::select! {
+                _ = hup.recv() => {}
+                _ = shutdown.changed() => continue,
+            }
+            info!(path = %path.display(), "SIGHUP received, reloading configuration");
+            match reload::reload(&path, &mut running, &registry, outbox.as_ref()).await {
+                Ok(summary) => {
+                    metrics.record_reload(true);
+                    info!(
+                        added = ?summary.added,
+                        removed = ?summary.removed,
+                        changed = ?summary.changed,
+                        "Configuration reloaded{}",
+                        if summary.is_noop() { " (no endpoint changes)" } else { "" }
+                    );
+                    if !summary.restart_required.is_empty() {
+                        warn!(settings = ?summary.restart_required, "These changed settings need a restart to take effect");
+                    }
+                    if !summary.orphaned_jobs.is_empty() {
+                        warn!(
+                            jobs = ?summary.orphaned_jobs,
+                            "Queued async jobs refer to targets that no longer exist; they will be dead-lettered \
+                             (replayable with `hermes-admin outbox replay` once the target is restored)"
+                        );
+                    }
+                }
+                Err(e) => {
+                    metrics.record_reload(false);
+                    error!(error = %e, "Configuration reload FAILED; still serving the previous configuration");
+                }
+            }
+        }
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
 
@@ -434,8 +503,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    let registry = Arc::new(Registry::build(&config));
+    let registry = Arc::new(SharedRegistry::new(Registry::build(&config)));
     let metrics = Arc::new(Metrics::new());
+    metrics.mark_config_loaded();
     let dispatcher = Arc::new(Dispatcher::new(args.request_timeout, &config.settings, metrics.clone()));
 
     // Async mode needs the durable outbox and its delivery workers.
@@ -468,6 +538,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         None
     };
+
+    // SIGHUP => reload the configuration file without restarting.
+    #[cfg(unix)]
+    {
+        worker_handles.push(spawn_reload_task(
+            args.config.clone(),
+            config.clone(),
+            registry.clone(),
+            outbox.clone(),
+            metrics.clone(),
+            shutdown_tx.subscribe(),
+        ));
+    }
 
     let state = AppState(Arc::new(Inner {
         registry,

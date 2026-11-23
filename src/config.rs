@@ -289,6 +289,34 @@ pub enum AuthConfig {
     /// Shared token (`Authorization: Bearer …`, or a custom header such as
     /// GitLab's `X-Gitlab-Token`).
     Bearer(BearerAuth),
+    /// Stripe webhooks: `Stripe-Signature: t=<unix>,v1=<hex>[,v1=<hex>…]`,
+    /// signing `"<t>.<body>"`. Requests outside the tolerance are rejected,
+    /// which is what stops a captured request from being replayed.
+    Stripe(StripeAuth),
+    /// Slack: `X-Slack-Signature: v0=<hex>` + `X-Slack-Request-Timestamp`,
+    /// signing `"v0:<timestamp>:<body>"`, with the same replay window.
+    Slack(SlackAuth),
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct StripeAuth {
+    /// The endpoint's signing secret (`whsec_…`); use `${ENV_VAR}`.
+    pub secret: String,
+    #[serde(default = "default_stripe_header")]
+    pub header: String,
+    /// Accepted clock difference between sender and Hermes.
+    #[serde(default = "default_tolerance_secs")]
+    pub tolerance_secs: u64,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SlackAuth {
+    /// Your Slack app's signing secret; use `${ENV_VAR}`.
+    pub secret: String,
+    #[serde(default = "default_tolerance_secs")]
+    pub tolerance_secs: u64,
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -353,6 +381,8 @@ impl AuthConfig {
         match self {
             AuthConfig::Hmac(_) => "hmac",
             AuthConfig::Bearer(_) => "bearer",
+            AuthConfig::Stripe(_) => "stripe",
+            AuthConfig::Slack(_) => "slack",
         }
     }
 }
@@ -377,15 +407,40 @@ impl std::fmt::Debug for BearerAuth {
             .finish()
     }
 }
+impl std::fmt::Debug for StripeAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StripeAuth")
+            .field("secret", &"<redacted>")
+            .field("header", &self.header)
+            .field("tolerance_secs", &self.tolerance_secs)
+            .finish()
+    }
+}
+impl std::fmt::Debug for SlackAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SlackAuth")
+            .field("secret", &"<redacted>")
+            .field("tolerance_secs", &self.tolerance_secs)
+            .finish()
+    }
+}
 impl std::fmt::Debug for AuthConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             AuthConfig::Hmac(a) => a.fmt(f),
             AuthConfig::Bearer(a) => a.fmt(f),
+            AuthConfig::Stripe(a) => a.fmt(f),
+            AuthConfig::Slack(a) => a.fmt(f),
         }
     }
 }
 
+fn default_stripe_header() -> String {
+    "Stripe-Signature".to_string()
+}
+fn default_tolerance_secs() -> u64 {
+    300
+}
 fn default_signature_header() -> String {
     "X-Hub-Signature-256".to_string()
 }
@@ -655,6 +710,20 @@ fn default_true() -> bool {
     true
 }
 
+/// Value of `NAME`, or if that is unset/empty the contents of the file named by
+/// `NAME_FILE` (the Docker / Kubernetes secrets convention). The file is read
+/// on every call, so a **config reload picks up a rotated secret** — a plain
+/// environment variable cannot change while the process runs.
+pub fn env_or_file(name: &str, getenv: &dyn Fn(&str) -> Option<String>) -> Option<String> {
+    if let Some(v) = getenv(name).filter(|v| !v.is_empty()) {
+        return Some(v);
+    }
+    let path = getenv(&format!("{name}_FILE")).filter(|p| !p.is_empty())?;
+    let content = std::fs::read_to_string(path).ok()?;
+    let trimmed = content.trim_end_matches(['\n', '\r']);
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
 /// `${VAR}`, `${VAR:-default}`, and `$$` for a literal `$`.
 /// An unset variable without a default is an error: failing at startup beats
 /// quietly running with an empty secret.
@@ -686,7 +755,7 @@ pub fn expand_env(input: &str, lookup: &dyn Fn(&str) -> Option<String>) -> Resul
                 }
                 match lookup(name).filter(|v| !v.is_empty()).or(default.map(str::to_string)) {
                     Some(v) => out.push_str(&v),
-                    None => return Err(format!("environment variable {name} is not set")),
+                    None => return Err(format!("environment variable {name} is not set (and {name}_FILE is unset or unreadable)")),
                 }
                 // skip past the closing brace
                 while chars.peek().is_some_and(|(j, _)| *j <= end) {
@@ -707,7 +776,7 @@ impl Config {
 
     pub fn from_yaml(content: &str) -> Result<Self, Box<dyn std::error::Error>> {
         let mut config: Config = serde_yaml::from_str(content)?;
-        config.expand_env_vars(&|name| std::env::var(name).ok())?;
+        config.expand_env_vars(&|name| env_or_file(name, &|k| std::env::var(k).ok()))?;
         Ok(config)
     }
 
@@ -728,6 +797,8 @@ impl Config {
             match &mut reg.auth {
                 Some(AuthConfig::Hmac(a)) => ex(&mut a.secret, &format!("{at}: auth.secret"), lookup)?,
                 Some(AuthConfig::Bearer(a)) => ex(&mut a.token, &format!("{at}: auth.token"), lookup)?,
+                Some(AuthConfig::Stripe(a)) => ex(&mut a.secret, &format!("{at}: auth.secret"), lookup)?,
+                Some(AuthConfig::Slack(a)) => ex(&mut a.secret, &format!("{at}: auth.secret"), lookup)?,
                 None => {}
             }
             for t in reg.target.iter_mut().chain(reg.targets.iter_mut()) {
@@ -814,6 +885,24 @@ impl Config {
                     if let Some(h) = &a.header {
                         reqwest::header::HeaderName::from_bytes(h.as_bytes())
                             .map_err(|e| format!("{at}: auth.header '{h}' is not a valid header name: {e}"))?;
+                    }
+                }
+                Some(AuthConfig::Stripe(a)) => {
+                    if a.secret.is_empty() {
+                        return Err(format!("{at}: auth.secret cannot be empty"));
+                    }
+                    if a.tolerance_secs == 0 {
+                        return Err(format!("{at}: auth.tolerance_secs must be >= 1"));
+                    }
+                    reqwest::header::HeaderName::from_bytes(a.header.as_bytes())
+                        .map_err(|e| format!("{at}: auth.header '{}' is not a valid header name: {e}", a.header))?;
+                }
+                Some(AuthConfig::Slack(a)) => {
+                    if a.secret.is_empty() {
+                        return Err(format!("{at}: auth.secret cannot be empty"));
+                    }
+                    if a.tolerance_secs == 0 {
+                        return Err(format!("{at}: auth.tolerance_secs must be >= 1"));
                     }
                 }
                 None => {}
@@ -1183,5 +1272,62 @@ registers:
         let cfg = parse("registers:\n  - { endpoint: /w, method: POST, template: '{}', target: { url: 'http://a' }, auth: { type: hmac, secret: topsecret } }\n");
         let dbg = format!("{:?}", cfg);
         assert!(!dbg.contains("topsecret") && dbg.contains("redacted"), "{dbg}");
+    }
+
+    #[test]
+    fn stripe_and_slack_auth_parse_validate_and_redact() {
+        let cfg = parse(
+            r#"
+registers:
+  - { endpoint: /st, method: POST, template: '{}', target: { url: "http://a" }, auth: { type: stripe, secret: whsec_top } }
+  - { endpoint: /sl, method: POST, template: '{}', target: { url: "http://a" }, auth: { type: slack, secret: slack_top, tolerance_secs: 60 } }
+"#,
+        );
+        cfg.validate().unwrap();
+        assert!(matches!(&cfg.registers[0].auth, Some(AuthConfig::Stripe(a)) if a.tolerance_secs == 300 && a.header == "Stripe-Signature"));
+        assert!(matches!(&cfg.registers[1].auth, Some(AuthConfig::Slack(a)) if a.tolerance_secs == 60));
+        assert_eq!(cfg.registers[0].auth.as_ref().unwrap().kind(), "stripe");
+        let dbg = format!("{:?}", cfg);
+        assert!(!dbg.contains("whsec_top") && !dbg.contains("slack_top"), "{dbg}");
+
+        let zero = parse("registers:\n  - { endpoint: /w, method: POST, template: '{}', target: { url: 'http://a' }, auth: { type: stripe, secret: s, tolerance_secs: 0 } }\n");
+        assert!(zero.validate().unwrap_err().contains("tolerance_secs"));
+        let empty = parse("registers:\n  - { endpoint: /w, method: POST, template: '{}', target: { url: 'http://a' }, auth: { type: slack, secret: '' } }\n");
+        assert!(empty.validate().unwrap_err().contains("secret cannot be empty"));
+    }
+
+    #[test]
+    fn stripe_secret_is_env_expanded() {
+        let mut cfg: Config = serde_yaml::from_str(
+            "registers:\n  - { endpoint: /w, method: POST, template: '{}', target: { url: 'http://a' }, auth: { type: stripe, secret: '${STRIPE_SECRET}' } }\n",
+        )
+        .unwrap();
+        cfg.expand_env_vars(&env(&[("STRIPE_SECRET", "whsec_x")])).unwrap();
+        assert!(matches!(&cfg.registers[0].auth, Some(AuthConfig::Stripe(a)) if a.secret == "whsec_x"));
+    }
+
+    #[test]
+    fn var_file_convention_for_rotatable_secrets() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("secret");
+        std::fs::write(&f, "from-file\n").unwrap();
+        let path = f.to_str().unwrap().to_string();
+        let getenv = move |extra: Option<(&'static str, String)>| {
+            let path = path.clone();
+            move |k: &str| match (k, &extra) {
+                ("S_FILE", _) => Some(path.clone()),
+                (n, Some((en, v))) if n == *en => Some(v.clone()),
+                _ => None,
+            }
+        };
+        assert_eq!(env_or_file("S", &getenv(None)).as_deref(), Some("from-file"), "trailing newline trimmed");
+        assert_eq!(env_or_file("S", &getenv(Some(("S", "from-env".into())))).as_deref(), Some("from-env"), "env wins");
+        std::fs::write(&f, "rotated").unwrap();
+        assert_eq!(env_or_file("S", &getenv(None)).as_deref(), Some("rotated"), "re-read every time");
+        std::fs::write(&f, "\n").unwrap();
+        assert_eq!(env_or_file("S", &getenv(None)), None, "empty file counts as unset");
+        assert_eq!(env_or_file("NOPE", &getenv(None)), None);
+        let missing = |k: &str| (k == "M_FILE").then(|| "/nonexistent/secret".to_string());
+        assert_eq!(env_or_file("M", &missing), None, "unreadable file counts as unset");
     }
 }

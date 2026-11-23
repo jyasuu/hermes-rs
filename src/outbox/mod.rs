@@ -324,6 +324,18 @@ impl Store {
         Ok(s)
     }
 
+    /// Which targets have jobs waiting: `(endpoint, target_index, label, count)`.
+    pub fn pending_targets(&self) -> DbResult<Vec<(String, usize, String, u64)>> {
+        let mut stmt = db(self.conn.prepare(
+            "SELECT endpoint, target_index, target_label, COUNT(*) FROM outbox
+             WHERE state IN ('pending','in_flight') GROUP BY endpoint, target_index, target_label",
+        ))?;
+        let rows = db(stmt.query_map([], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as usize, r.get::<_, String>(2)?, r.get::<_, i64>(3)? as u64))
+        }))?;
+        rows.map(|r| db(r)).collect()
+    }
+
     pub fn list(&self, state: Option<JobState>, limit: usize) -> DbResult<Vec<JobRow>> {
         let mut stmt = db(self.conn.prepare(
             "SELECT id, message_id, endpoint, target_label, state, attempts, last_error, created_at, updated_at
@@ -446,6 +458,9 @@ impl Outbox {
     }
     pub async fn prune(&self, delivered_keep_ms: i64, dead_keep_ms: i64) -> DbResult<usize> {
         self.run(move |s| s.prune(now_ms(), delivered_keep_ms, dead_keep_ms)).await
+    }
+    pub async fn pending_targets(&self) -> DbResult<Vec<(String, usize, String, u64)>> {
+        self.run(|s| s.pending_targets()).await
     }
     pub async fn stats(&self) -> DbResult<Stats> {
         self.run(|s| s.stats(now_ms())).await
@@ -592,6 +607,20 @@ mod tests {
         // after pruning, the message id can be accepted again
         let mut s2 = s;
         assert_eq!(s2.enqueue("a", "/e", &jobs(1), 10, T0).unwrap(), Enqueued::Duplicate, "dead row still blocks");
+    }
+
+    #[test]
+    fn pending_targets_groups_waiting_jobs_only() {
+        let (mut s, _d) = store();
+        s.enqueue("m1", "/e", &jobs(2), 100, T0).unwrap();
+        s.enqueue("m2", "/e", &jobs(1), 100, T0).unwrap();
+        let j = s.claim(T0, 1000).unwrap().unwrap(); // m1/t0 in flight: still counts
+        let done = s.claim(T0, 1000).unwrap().unwrap(); // m1/t1
+        s.complete(done.id, 1, T0).unwrap(); // delivered: must not count
+        let _ = j;
+        let mut rows = s.pending_targets().unwrap();
+        rows.sort();
+        assert_eq!(rows, vec![("/e".to_string(), 0, "t0".to_string(), 2)]);
     }
 
     #[test]

@@ -196,3 +196,31 @@ registers:
     method: POST
     template: '{"n": 1}'
     target: { url: "http://127.0.0.1:3999/slow2" }
+
+  # ================= timestamped signatures (replay protection) =================
+  - endpoint: /webhook/stripe-in
+    method: POST
+    auth: { type: stripe, secret: "whsec_e2e", tolerance_secs: 300 }
+    template: '{"ok": true}'
+    target: { url: "http://127.0.0.1:3999/auth-ok" }
+
+  - endpoint: /webhook/slack-in
+    method: POST
+    auth: { type: slack, secret: "slack_e2e" }
+    template: '{"ok": true}'
+    target: { url: "http://127.0.0.1:3999/auth-ok" }
+
+  # secret read from ${E2E_ROT_SECRET} or, failing that, the file named by E2E_ROT_SECRET_FILE
+  - endpoint: /webhook/auth-rot
+    method: POST
+    auth: { type: hmac, secret: "${E2E_ROT_SECRET}" }
+    template: '{"ok": true}'
+    target: { url: "http://127.0.0.1:3999/auth-ok" }
+
+  # destination is down, so its job stays queued; used to test orphan detection on reload
+  - endpoint: /webhook/async-orphan
+    method: POST
+    mode: async
+    template: '{"n": 1}'
+    retry_config: { attempts: 50, delay_ms: 300, backoff_multiplier: 1.0, max_delay_ms: 300, jitter: false, max_elapsed_ms: null }
+    target: { name: ghost, url: "http://127.0.0.1:3996/down" }

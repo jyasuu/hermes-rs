@@ -21,6 +21,8 @@ pub struct Metrics {
     outbox_delivered: IntCounterVec,
     outbox_jobs: IntGaugeVec,
     outbox_oldest: Gauge,
+    reloads: IntCounterVec,
+    last_reload: Gauge,
 }
 
 impl Metrics {
@@ -64,6 +66,16 @@ impl Metrics {
             "Age of the oldest job still waiting for delivery; grows during an outage.",
         )
         .unwrap();
+        let reloads = IntCounterVec::new(
+            Opts::new("hermes_config_reloads_total", "Configuration reload attempts (SIGHUP) by result."),
+            &["result"],
+        )
+        .unwrap();
+        let last_reload = Gauge::new(
+            "hermes_config_last_success_timestamp_seconds",
+            "Unix time the running configuration was loaded (startup or last successful reload).",
+        )
+        .unwrap();
         let info = IntGaugeVec::new(Opts::new("hermes_build_info", "Build information."), &["version"]).unwrap();
         info.with_label_values(&[env!("CARGO_PKG_VERSION")]).set(1);
 
@@ -74,9 +86,11 @@ impl Metrics {
         reg(Box::new(outbox_delivered.clone()));
         reg(Box::new(outbox_jobs.clone()));
         reg(Box::new(outbox_oldest.clone()));
+        reg(Box::new(reloads.clone()));
+        reg(Box::new(last_reload.clone()));
         reg(Box::new(info));
 
-        Self { registry, requests, attempts, attempt_seconds, dead_lettered, outbox_delivered, outbox_jobs, outbox_oldest }
+        Self { registry, requests, attempts, attempt_seconds, dead_lettered, outbox_delivered, outbox_jobs, outbox_oldest, reloads, last_reload }
     }
 
     pub fn record_request(&self, endpoint: &str, outcome: &str) {
@@ -105,6 +119,22 @@ impl Metrics {
             self.outbox_jobs.with_label_values(&[state]).set(n as i64);
         }
         self.outbox_oldest.set(s.oldest_pending_age_ms.map(|ms| ms as f64 / 1000.0).unwrap_or(0.0));
+    }
+
+    /// `ok == true` also stamps "configuration loaded now".
+    pub fn record_reload(&self, ok: bool) {
+        self.reloads.with_label_values(&[if ok { "success" } else { "failure" }]).inc();
+        if ok {
+            self.mark_config_loaded();
+        }
+    }
+
+    pub fn mark_config_loaded(&self) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(0.0);
+        self.last_reload.set(now);
     }
 
     pub fn render(&self) -> String {
@@ -173,5 +203,19 @@ mod tests {
         assert!(line(&out, r#"hermes_outbox_dead_lettered_total{endpoint="/w",target="api"} 1"#).is_some());
         assert!(line(&out, r#"hermes_outbox_jobs_delivered_total{endpoint="/w",target="api"} 1"#).is_some());
         assert!(line(&out, "hermes_build_info{version=").is_some());
+    }
+
+    #[test]
+    fn reload_counters_and_timestamp() {
+        let m = Metrics::new();
+        m.mark_config_loaded();
+        m.record_reload(true);
+        m.record_reload(false);
+        m.record_reload(false);
+        let out = m.render();
+        assert!(line(&out, r#"hermes_config_reloads_total{result="success"} 1"#).is_some());
+        assert!(line(&out, r#"hermes_config_reloads_total{result="failure"} 2"#).is_some());
+        let ts: f64 = line(&out, "hermes_config_last_success_timestamp_seconds ").unwrap().rsplit(' ').next().unwrap().parse().unwrap();
+        assert!(ts > 1.7e9, "{ts}");
     }
 }

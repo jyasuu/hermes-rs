@@ -3,7 +3,7 @@
 use super::{now_ms, Job, Outbox};
 use crate::config::OutboxSettings;
 use crate::metrics::Metrics;
-use crate::registry::Registry;
+use crate::registry::SharedRegistry;
 use crate::sink::{Attempt, DeliveryCtx, Dispatcher};
 use serde_json::Value;
 use std::{sync::Arc, time::Duration};
@@ -14,7 +14,7 @@ use tracing::{error, info, warn};
 #[derive(Clone)]
 pub struct WorkerContext {
     pub outbox: Outbox,
-    pub registry: Arc<Registry>,
+    pub registry: Arc<SharedRegistry>,
     pub dispatcher: Arc<Dispatcher>,
     pub settings: OutboxSettings,
     pub metrics: Arc<Metrics>,
@@ -128,8 +128,8 @@ async fn process(ctx: &WorkerContext, job: Job) {
 
     // Re-resolve the target from the *current* config. The label guards
     // against the config having been reordered or edited since enqueue.
-    let compiled = ctx
-        .registry
+    let registry = ctx.registry.current(); // snapshot: a reload cannot change it mid-job
+    let compiled = registry
         .registers
         .get(&job.endpoint)
         .and_then(|r| r.targets.get(job.target_index))

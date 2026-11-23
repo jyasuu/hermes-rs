@@ -55,3 +55,11 @@ groups:
         labels: { severity: warning }
         annotations:
           summary: "Hermes is rejecting requests with 503 (concurrency limit or outbox full)"
+
+      # Hermes keeps serving the OLD configuration when a reload is rejected,
+      # so nothing visibly breaks: this is the only signal that your edit did not apply.
+      - alert: HermesConfigReloadFailed
+        expr: increase(hermes_config_reloads_total{result="failure"}[10m]) > 0
+        labels: { severity: warning }
+        annotations:
+          summary: "A config reload was rejected; Hermes is still running the previous configuration (see its log)"

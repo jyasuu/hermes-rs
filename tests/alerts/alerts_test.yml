@@ -73,3 +73,21 @@ tests:
           - exp_labels: { severity: warning, endpoint: /w, target: bad }
             exp_annotations:
               summary: "Over 20% of deliveries to bad (/w) are failing"
+
+  # A rejected SIGHUP reload must be noticed even though the service keeps working.
+  - interval: 1m
+    input_series:
+      - series: 'hermes_config_reloads_total{result="failure"}'
+        values: '0 0 0 1 1 1 1'
+      - series: 'hermes_config_reloads_total{result="success"}'
+        values: '0 1 2 2 3 4 5'
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: HermesConfigReloadFailed
+        exp_alerts: []
+      - eval_time: 4m
+        alertname: HermesConfigReloadFailed
+        exp_alerts:
+          - exp_labels: { severity: warning, result: failure }
+            exp_annotations:
+              summary: "A config reload was rejected; Hermes is still running the previous configuration (see its log)"
